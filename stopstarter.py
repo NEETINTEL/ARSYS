@@ -304,7 +304,7 @@ class YouTubeAPI:
         params = {"part": "snippet,status,contentDetails"}
         
         # Load description from file
-        description = "This livestream was created using stopstarter.py.\n\n[This is a fallback description.]"  # fallback
+        description = "This livestream has been created using the Automated Relay System for Youtube livestreams.\n\n[This is a fallback description.]"  # fallback
         try:
             with open(DESCRIPTION_FILE, 'r', encoding='utf-8') as f:
                 description = f.read().strip()
