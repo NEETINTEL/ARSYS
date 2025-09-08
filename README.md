@@ -6,13 +6,13 @@ The Automated Relay SYStem (ARSYS) represents a solution to that end. Created pr
 
 ### Requirements
 * YouTube channel with YouTube Data API v3 enabled
-* OBS (ver 27.2.4 or higher) with obs-websocket extension installed
-  * _(websocket is installed by default with most newer versions of OBS)_
+* OBS (ver 27.2.4 or higher) with [obs-websocket](https://github.com/obsproject/obs-websocket) extension installed
+  * _(websocket is now included by default starting with OBS 28.0.0)_
 
 ### Configuration
 * __Mandatory:__ a `/passwords/` folder with;
   * `client_secrets.json` downloaded via Google Cloud Console
-  * `passwords.txt` created by the user with a YouTube refresh token, OBS websocket port number, and OBS websocket password
+  * `passwords.txt` updated by the user to include details of YouTube refresh token, OBS-websocket port number, and OBS-websocket password
 * __Optional:__ a `/script_files/` folder with;
   * `stopstarter_description.txt`
 * __Optional:__ a `/thumbnails/` folder with;
