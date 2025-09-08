@@ -20,4 +20,4 @@ The Automated Relay SYStem (ARSYS) represents a solution to that end. Created pr
   * `thumbnail.jpg` 
 
 
-_NOTE:_ I do not really 'get' GitHub and so some of this may be baffling.
+__NOTE:__ I do not really 'get' GitHub and so I may be doing some of this 'the wrong way'. I hope the script can still be of value despite that. Feedback and suggestions are welcome.
