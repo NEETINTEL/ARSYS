@@ -16,7 +16,7 @@ The Automated Relay SYStem (ARSYS) represents a solution to that end. Created pr
   * `passwords.txt` created by the user with a YouTube refresh token, OBS websocket port number, and OBS websocket password
 * __Optional:__ a `/script_files/` folder with;
   * `stopstarter_description.txt`
-* __Optional:__ a `thumbnails/` folder with;
+* __Optional:__ a `/thumbnails/` folder with;
   * `thumbnail.jpg` 
 
 
