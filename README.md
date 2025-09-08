@@ -6,7 +6,6 @@ The Automated Relay SYStem (ARSYS) represents a solution to that end. Created pr
 
 ### Requirements
 * YouTube channel with YouTube Data API v3 enabled
-  * Test
 * OBS (ver 27.2.4 or higher) with obs-websocket extension installed
   * _(websocket is installed by default with most newer versions of OBS)_
 
