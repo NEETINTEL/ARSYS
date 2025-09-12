@@ -157,9 +157,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Avoid user data ending up in version control
-#passwords/*
-#thumbnails/*
+passwords/*
+thumbnails/*
+script_files/*
 
 # Keep README files
-!passwords/README.md
-!thumbnails/README.md
+!passwords/readme.md
+!thumbnails/readme.md
+!script_files/readme.md
