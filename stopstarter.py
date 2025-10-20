@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-YouTube Stream Scheduler with OBS WebSocket 5.x Integration
+YouTube Stream Scheduler with OBS WebSocket Integration
 Automatically manages YouTube live stream lifecycle with proper API calls
 """
-
 import json
 import time
 import socket
@@ -30,7 +29,7 @@ SCHEDULE_SETS = [
 SCHEDULE_TOLERANCE_SECONDS = 10
 
 # How many seconds before the scheduled start time to begin attempting to go live
-START_EARLY_SECONDS = 5
+START_EARLY_SECONDS = 2
 
 # YouTube video category ID
 # Refer to https://developers.google.com/youtube/v3/docs/videoCategories/list
@@ -302,7 +301,7 @@ class YouTubeAPI:
         params = {"part": "snippet,status,contentDetails"}
         
         # Load description from file
-        description = "This livestream has been created using the Automated Relay System for Youtube livestreams.\n\n[This is a fallback description.]"  # fallback
+        description = "This livestream was created using stopstarter.py.\n\n[This is a fallback description.]"  # fallback
         try:
             with open(DESCRIPTION_FILE, 'r', encoding='utf-8') as f:
                 description = f.read().strip()
@@ -335,7 +334,7 @@ class YouTubeAPI:
             print(f"Created new broadcast: {title} [ID: {broadcast_id}]")
             
             # Upload random thumbnail
-            thumbnail_path = self.get_random_thumbnail()
+            thumbnail_path = self.get_thumbnail()
             if thumbnail_path:
                 self.upload_thumbnail(broadcast_id, thumbnail_path)
             else:
@@ -355,10 +354,6 @@ class YouTubeAPI:
                 # Store stream ID and key for this broadcast
                 self.current_stream_id = stream_id
                 self.current_stream_key = stream_key
-                
-                # Immediately configure OBS with the new stream key
-                print(f"Configuring OBS with new stream key...")
-                # Note: This will be called by the scheduler, not here directly
             
             return broadcast_id
         else:
@@ -408,7 +403,7 @@ class YouTubeAPI:
             print(f"Failed to bind stream to broadcast")
             return False
     
-    def wait_for_stream_active(self, stream_id, max_wait_seconds=120):
+    def wait_for_stream_active(self, stream_id, max_wait_seconds=240):
         """Wait for YouTube to detect the stream as active"""
         print(f"Waiting for stream {stream_id} to become active...")
         
@@ -667,39 +662,83 @@ class OBSWebSocket:
             print(f"Unexpected error receiving message: {e}")
             return None
     
-    def send_request(self, request_type, request_data=None):
-        """Send request to OBS using WebSocket 5.x format"""
+    def send_request(self, request_type, request_data=None, max_retries=3, retry_delay=2):
+        """Send request to OBS using WebSocket 5.x format with retry logic"""
         if not self.authenticated:
             print("Not authenticated to OBS WebSocket")
             return False
         
-        request_id = str(int(time.time() * 1000))
-        message = {
-            "op": 6,  # Request
-            "d": {
-                "requestType": request_type,
-                "requestId": request_id
-            }
-        }
-        
-        if request_data:
-            message["d"]["requestData"] = request_data
-        
-        self._send_message(message)
-        
-        # Wait for response
-        response = self._receive_message()
-        if response and response.get('op') == 7:  # RequestResponse
-            request_status = response.get('d', {}).get('requestStatus', {})
-            if request_status.get('result'):
-                print(f"OBS command successful: {request_type}")
-                return True
+        for attempt in range(1, max_retries + 1):
+            try:
+                request_id = str(int(time.time() * 1000))
+                message = {
+                    "op": 6,  # Request
+                    "d": {
+                        "requestType": request_type,
+                        "requestId": request_id
+                    }
+                }
+                
+                if request_data:
+                    message["d"]["requestData"] = request_data
+                
+                self._send_message(message)
+                
+                # Wait for response with timeout
+                start_time = time.time()
+                timeout = 10  # 10 second timeout per attempt
+                
+                while time.time() - start_time < timeout:
+                    response = self._receive_message()
+                    
+                    if not response:
+                        time.sleep(0.1)  # Brief pause before checking again
+                        continue
+                    
+                    if response.get('op') == 7:  # RequestResponse
+                        request_status = response.get('d', {}).get('requestStatus', {})
+                        response_data = response.get('d', {}).get('responseData', {})
+                        
+                        if request_status.get('result'):
+                            if attempt > 1:
+                                print(f"OBS command successful on attempt {attempt}: {request_type}")
+                            else:
+                                print(f"OBS command successful: {request_type}")
+                            return True
+                        else:
+                            error_code = request_status.get('code', 'UNKNOWN')
+                            error_comment = request_status.get('comment', 'No error message')
+                            print(f"OBS command failed: {request_type}")
+                            print(f"  Error code: {error_code}")
+                            print(f"  Error message: {error_comment}")
+                            if response_data:
+                                print(f"  Response data: {response_data}")
+                            
+                            # Don't retry on certain error codes
+                            if error_code in [600, 601, 602]:  # Request errors that won't be fixed by retry
+                                print(f"  Non-retryable error, aborting")
+                                return False
+                            
+                            # Otherwise, will retry if attempts remain
+                            break
+                    elif response.get('op') == 5:  # Event - ignore and continue waiting
+                        continue
+                
+                # If we get here, timeout occurred
+                print(f"No response received for: {request_type} (attempt {attempt}/{max_retries})")
+                
+            except Exception as e:
+                print(f"Exception during OBS request {request_type} (attempt {attempt}/{max_retries}): {e}")
+            
+            # Retry logic
+            if attempt < max_retries:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
             else:
-                print(f"OBS command failed: {request_type} - {request_status}")
+                print(f"All {max_retries} attempts failed for: {request_type}")
                 return False
-        else:
-            print(f"No response received for: {request_type}")
-            return False
+        
+        return False
     
     def stop_streaming(self):
         """Stop OBS streaming"""
@@ -719,6 +758,35 @@ class OBSWebSocket:
             }
         }
         return self.send_request("SetStreamServiceSettings", stream_settings)
+    
+    def get_stream_status(self):
+        """Get OBS streaming status"""
+        request_id = str(int(time.time() * 1000))
+        message = {
+            "op": 6,  # Request
+            "d": {
+                "requestType": "GetStreamStatus",
+                "requestId": request_id
+            }
+        }
+        
+        self._send_message(message)
+        
+        # Keep receiving messages until we get the response
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            response = self._receive_message()
+            
+            if not response:
+                continue
+                
+            if response.get('op') == 7:  # RequestResponse
+                response_data = response.get('d', {}).get('responseData', {})
+                return response_data.get('outputActive', False)
+            elif response.get('op') == 5:  # Event - ignore and continue waiting
+                continue
+        
+        return False  # Assume not streaming if we can't get status
     
     def close(self):
         """Close connection"""
@@ -830,7 +898,7 @@ class StreamScheduler:
         wait_interval = 2   # Check every 2 seconds
         
         for i in range(max_wait_time // wait_interval):
-            if self._check_obs_streaming_status():
+            if self.obs.get_stream_status():
                 print(f"OBS still streaming, waiting... ({i+1})")
                 time.sleep(wait_interval)
             else:
@@ -838,38 +906,6 @@ class StreamScheduler:
                 return
         
         print("Timeout waiting for OBS to stop streaming, proceeding anyway...")
-    
-    def _check_obs_streaming_status(self):
-        """Check if OBS is currently streaming"""
-        if not self.obs.authenticated:
-            return False
-        
-        request_id = str(int(time.time() * 1000))
-        message = {
-            "op": 6,  # Request
-            "d": {
-                "requestType": "GetStreamStatus",
-                "requestId": request_id
-            }
-        }
-        
-        self.obs._send_message(message)
-        
-        # Keep receiving messages until we get the response (op: 7) for our request
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            response = self.obs._receive_message()
-            
-            if not response:
-                continue
-                
-            if response.get('op') == 7:  # RequestResponse
-                response_data = response.get('d', {}).get('responseData', {})
-                return response_data.get('outputActive', False)
-            elif response.get('op') == 5:  # Event - ignore and continue waiting
-                continue
-        
-        return False  # Assume not streaming if we can't get status after all attempts
     
     def stop_current_stream(self):
         """Stop current stream and prepare for next"""
@@ -956,27 +992,11 @@ class StreamScheduler:
             print("No next broadcast to start")
             return False
         
-        # First, verify OBS is streaming
-        print("Verifying OBS is streaming before starting YouTube broadcast...")
-        if not self._check_obs_streaming_status():
-            print("OBS is not streaming - attempting to start streaming...")
-            if self.obs.start_streaming():
-                print("Successfully started OBS streaming")
-                # Wait a moment for streaming to stabilize
-                time.sleep(5)
-                # Verify again
-                if not self._check_obs_streaming_status():
-                    print("OBS streaming verification failed after start attempt")
-                    return False
-            else:
-                print("Failed to start OBS streaming - cannot proceed with broadcast")
-                return False
+        # OBS is already streaming with the correct key from create_next_stream()
+        # No need to verify - proceed directly to waiting for YouTube stream detection
         
-        # OBS is already streaming with the correct key - wait for YouTube to detect the stream as active
+        # Wait for YouTube to detect the stream as active
         if self.next_stream_id and self.youtube.wait_for_stream_active(self.next_stream_id):
-            # Debug: Check broadcast status before attempting transition
-            self._debug_broadcast_status(self.next_broadcast_id)
-            
             # First transition to testing if in ready status
             if self._get_broadcast_status(self.next_broadcast_id) == 'ready':
                 print("Broadcast is in 'ready' status, transitioning to 'testing' first...")
@@ -1013,54 +1033,6 @@ class StreamScheduler:
         print("Failed to start broadcast - stream not active or API call failed")
         return False
     
-    def _debug_broadcast_status(self, broadcast_id):
-        """Debug helper to print current broadcast and stream status"""
-        print(f"=== DEBUG: Checking status before transition ===")
-        
-        # Get broadcast status
-        url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
-        params = {
-            "part": "id,snippet,status,contentDetails",
-            "id": broadcast_id
-        }
-        
-        response = self.youtube._make_api_request(url, params=params)
-        if response and response.get('items'):
-            broadcast = response['items'][0]
-            status = broadcast.get('status', {})
-            content_details = broadcast.get('contentDetails', {})
-            
-            print(f"Broadcast ID: {broadcast_id}")
-            print(f"Broadcast lifecycle status: {status.get('lifeCycleStatus')}")
-            print(f"Broadcast privacy status: {status.get('privacyStatus')}")
-            print(f"Broadcast recording status: {status.get('recordingStatus')}")
-            
-            # Get bound stream info
-            bound_stream_id = content_details.get('boundStreamId')
-            if bound_stream_id:
-                print(f"Bound stream ID: {bound_stream_id}")
-                
-                # Get stream status
-                stream_url = "https://www.googleapis.com/youtube/v3/liveStreams"
-                stream_params = {
-                    "part": "id,status",
-                    "id": bound_stream_id
-                }
-                
-                stream_response = self.youtube._make_api_request(stream_url, params=stream_params)
-                if stream_response and stream_response.get('items'):
-                    stream_status = stream_response['items'][0].get('status', {})
-                    print(f"Stream status: {stream_status.get('streamStatus')}")
-                    print(f"Stream health status: {stream_status.get('healthStatus', {}).get('status')}")
-                else:
-                    print("Could not retrieve stream status")
-            else:
-                print("No bound stream found")
-        else:
-            print(f"Could not retrieve broadcast status for {broadcast_id}")
-        
-        print(f"=== END DEBUG ===")
-    
     def _get_broadcast_status(self, broadcast_id):
         """Get current broadcast lifecycle status"""
         url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
@@ -1075,61 +1047,62 @@ class StreamScheduler:
         return None
     
     def run_schedule(self):
-            """Main scheduling loop with event-based timing and low-activity mode"""
-            print(f"Stream scheduler running with {len(SCHEDULE_SETS)} daily schedule sets:")
-            for i, (stop_time_str, start_time_str) in enumerate(SCHEDULE_SETS):
-                print(f"  SET {i+1}: {stop_time_str} -> {start_time_str} UTC")
-            print(f"Schedule tolerance: {SCHEDULE_TOLERANCE_SECONDS} seconds")
-            print(f"Early start window: {START_EARLY_SECONDS} seconds")
-            print()
-            
-            while True:
-                try:
-                    now = datetime.now(timezone.utc)
+        """Main scheduling loop with event-based timing and low-activity mode"""
+        print(f"Stream scheduler running with {len(SCHEDULE_SETS)} daily schedule sets:")
+        for i, (stop_time_str, start_time_str) in enumerate(SCHEDULE_SETS):
+            print(f"  SET {i+1}: {stop_time_str} -> {start_time_str} UTC")
+        print(f"Schedule tolerance: {SCHEDULE_TOLERANCE_SECONDS} seconds")
+        print(f"Early start window: {START_EARLY_SECONDS} seconds")
+        print()
+        
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                
+                # Get next event
+                next_event, event_time = self.get_next_event(now)
+                
+                if next_event and event_time:
+                    time_until_event = (event_time - now).total_seconds()
                     
-                    # Get next event
-                    next_event, event_time = self.get_next_event(now)
+                    # Check if we should enter low-activity mode
+                    if time_until_event > 3 * 60 * 60:  # More than 3 hours until next event
+                        print(f"Next event in {time_until_event/3600:.1f} hours - entering low-activity mode (30-minute intervals)")
+                        time.sleep(30 * 60)  # 30 minutes
+                        continue
                     
-                    if next_event and event_time:
-                        time_until_event = (event_time - now).total_seconds()
-                        
-                        # Check if we should enter low-activity mode
-                        if time_until_event > 3 * 60 * 60:  # More than 3 hours until next event
-                            print(f"Next event in {time_until_event/3600:.1f} hours - entering low-activity mode (30-minute intervals)")
-                            time.sleep(30 * 60)  # 30 minutes
-                            continue
-                        
-                        # Execute if it's time
-                        if time_until_event <= SCHEDULE_TOLERANCE_SECONDS:
-                            if next_event.event_type == "STOP":
-                                print(f"Executing STOP event")
-                                self.stop_current_stream()
-                                self.create_next_stream(next_event.original_start_time)
-                                time.sleep(15)  # Prevent duplicate execution
-                            elif next_event.event_type == "START":
-                                print(f"Executing START event")
-                                if self.next_broadcast_id:
-                                    self.start_next_stream()
-                                time.sleep(15)  # Prevent duplicate execution
-                        
-                        # Adaptive sleep timing (for periods closer to events)
-                        elif time_until_event <= 30:
-                            time.sleep(0)  # High precision
-                        elif time_until_event <= 300:  # 5 minutes
-                            time.sleep(10)  # Medium precision
-                        else:
-                            time.sleep(30)  # Low precision
+                    # Execute if it's time
+                    if time_until_event <= SCHEDULE_TOLERANCE_SECONDS:
+                        if next_event.event_type == "STOP":
+                            print(f"Executing STOP event")
+                            self.stop_current_stream()
+                            self.create_next_stream(next_event.original_start_time)
+                            time.sleep(15)  # Prevent duplicate execution
+                        elif next_event.event_type == "START":
+                            print()
+                            print(f"Executing START event")
+                            if self.next_broadcast_id:
+                                self.start_next_stream()
+                            time.sleep(15)  # Prevent duplicate execution
+                    
+                    # Adaptive sleep timing (for periods closer to events)
+                    elif time_until_event <= 30:
+                        time.sleep(0)  # High precision
+                    elif time_until_event <= 300:  # 5 minutes
+                        time.sleep(10)  # Medium precision
                     else:
-                        print("No scheduled events found")
-                        time.sleep(60)
-                        
-                except Exception as e:
-                    print(f"Exception in main loop: {e}")
-                    print("Continuing...")
-                    time.sleep(5)
+                        time.sleep(30)  # Low precision
+                else:
+                    print("No scheduled events found")
+                    time.sleep(60)
+                    
+            except Exception as e:
+                print(f"Exception in main loop: {e}")
+                print("Continuing...")
+                time.sleep(5)
 
 def main():
-    print("24/7 Automated Livestream Relay System Public v0.2")
+    print("24/7 Automated Livestream Relay System v0.23")
     print("Python3 + OBS WebSocket 5.1 + YouTube API v3")
     print()
     
