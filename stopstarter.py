@@ -10,13 +10,11 @@ import socket
 import struct
 import hashlib
 import base64
-import random
 import requests
 from datetime import datetime, timedelta, timezone, time as dt_time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import os
-import glob
 
 # USER CONFIGURATION
 # Stream identifier for matching broadcasts
@@ -1131,7 +1129,7 @@ class StreamScheduler:
                     time.sleep(5)
 
 def main():
-    print("24/7 Automated Livestream Relay System Public v0.1")
+    print("24/7 Automated Livestream Relay System Public v0.2")
     print("Python3 + OBS WebSocket 5.1 + YouTube API v3")
     print()
     
