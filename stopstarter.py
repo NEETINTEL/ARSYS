@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YouTube Stream Scheduler with OBS WebSocket Integration
+YouTube Stream Scheduler with OBS WebSocket 5.x Integration
 Automatically manages YouTube live stream lifecycle with proper API calls
 """
 import json
@@ -9,11 +9,13 @@ import socket
 import struct
 import hashlib
 import base64
+import random
 import requests
 from datetime import datetime, timedelta, timezone, time as dt_time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import os
+import glob
 
 # USER CONFIGURATION
 # Stream identifier for matching broadcasts
@@ -218,15 +220,31 @@ class YouTubeAPI:
             print(f"Failed to end broadcast: {broadcast_id}")
             return False
     
-    def get_thumbnail(self):
-        """Get thumbnail.jpg from the thumbnails directory"""
-        thumbnail_path = os.path.join(THUMBNAILS_DIR, "thumbnail.jpg")
-        
-        if os.path.exists(thumbnail_path):
-            return thumbnail_path
-        else:
-            print(f"thumbnail.jpg not found in {THUMBNAILS_DIR}")
+    def get_random_thumbnail(self):
+        """Select a random JPG from the thumbnails directory"""
+        if not os.path.exists(THUMBNAILS_DIR):
+            print(f"Thumbnails directory not found: {THUMBNAILS_DIR}")
             return None
+        
+        # Find all JPG files in the thumbnails directory
+        jpg_patterns = [
+            os.path.join(THUMBNAILS_DIR, "*.jpg"),
+            os.path.join(THUMBNAILS_DIR, "*.jpeg"),
+            os.path.join(THUMBNAILS_DIR, "*.JPG"),
+            os.path.join(THUMBNAILS_DIR, "*.JPEG")
+        ]
+        
+        thumbnail_files = []
+        for pattern in jpg_patterns:
+            thumbnail_files.extend(glob.glob(pattern))
+        
+        if not thumbnail_files:
+            print(f"No JPG files found in {THUMBNAILS_DIR}")
+            return None
+        
+        selected_thumbnail = random.choice(thumbnail_files)
+        print(f"Selected thumbnail: {os.path.basename(selected_thumbnail)}")
+        return selected_thumbnail
     
     def upload_thumbnail(self, broadcast_id, thumbnail_path):
         """Upload a thumbnail for the broadcast"""
@@ -334,7 +352,7 @@ class YouTubeAPI:
             print(f"Created new broadcast: {title} [ID: {broadcast_id}]")
             
             # Upload random thumbnail
-            thumbnail_path = self.get_thumbnail()
+            thumbnail_path = self.get_random_thumbnail()
             if thumbnail_path:
                 self.upload_thumbnail(broadcast_id, thumbnail_path)
             else:
