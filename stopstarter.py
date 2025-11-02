@@ -3,6 +3,7 @@
 YouTube Stream Scheduler with OBS WebSocket 5.x Integration
 Automatically manages YouTube live stream lifecycle with proper API calls
 """
+
 import json
 import time
 import socket
@@ -11,17 +12,20 @@ import hashlib
 import base64
 import random
 import requests
+import errno
 from datetime import datetime, timedelta, timezone, time as dt_time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import os
 import glob
 
+# ============================================================================
 # USER CONFIGURATION
-# Stream identifier for matching broadcasts
+# ============================================================================
+
 LIVESTREAM_NAME = "LIVESTREAM"
 
-# Format: ("STOP_TIME", "START_TIME") using 24-hour format with leading zeros
+# Schedule sets: (STOP_TIME, START_TIME) in 24-hour format with leading zeros
 SCHEDULE_SETS = [
     ("11:56", "12:00"),
     ("23:56", "00:00"),
@@ -30,22 +34,35 @@ SCHEDULE_SETS = [
 # Schedule timing tolerance in seconds
 SCHEDULE_TOLERANCE_SECONDS = 10
 
-# How many seconds before the scheduled start time to begin attempting to go live
+# How many seconds before scheduled start time to begin going live
 START_EARLY_SECONDS = 2
 
-# YouTube video category ID
-# Refer to https://developers.google.com/youtube/v3/docs/videoCategories/list
+# YouTube video category ID (25 = News & Politics)
 YOUTUBE_CATEGORY_ID = "28"
+
+# ============================================================================
+# FILE PATHS
+# ============================================================================
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CLIENT_SECRETS_FILE = os.path.join(SCRIPT_DIR, "passwords/client_secrets.json")
+PASSWORDS_FILE = os.path.join(SCRIPT_DIR, "passwords/passwords.txt")
+THUMBNAILS_DIR = os.path.join(SCRIPT_DIR, "thumbnails")
+DESCRIPTION_FILE = os.path.join(SCRIPT_DIR, "script_files/stopstarter_description.txt")
+
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
 
 @dataclass
 class ScheduledEvent:
+    """Represents a scheduled event (START or STOP)"""
     event_type: str  # "STOP" or "START"
     time: dt_time
     original_start_time: dt_time  # For START events, this is the actual broadcast time
     
     def get_next_occurrence(self, from_datetime: datetime) -> datetime:
         """Get the next occurrence of this event after the given datetime"""
-        # Create a datetime for today with this event's time
         today_event = datetime.combine(from_datetime.date(), self.time, timezone.utc)
         
         if today_event > from_datetime:
@@ -54,29 +71,32 @@ class ScheduledEvent:
             # Event already passed today, return tomorrow's occurrence
             return today_event + timedelta(days=1)
 
-def parse_time_string(time_str):
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def parse_time_string(time_str: str) -> Tuple[int, int]:
     """Convert time string like '11:55' to (hour, minute) tuple"""
     hour_str, minute_str = time_str.split(':')
     return (int(hour_str), int(minute_str))
 
-# File paths
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CLIENT_SECRETS_FILE = os.path.join(SCRIPT_DIR, "passwords/client_secrets.json")
-PASSWORDS_FILE = os.path.join(SCRIPT_DIR, "passwords/passwords.txt")
-THUMBNAILS_DIR = os.path.join(SCRIPT_DIR, "thumbnails")
-DESCRIPTION_FILE = os.path.join(SCRIPT_DIR, "script_files/stopstarter_description.txt")
+# ============================================================================
+# PASSWORD MANAGER
+# ============================================================================
 
 class PasswordManager:
-    def __init__(self, passwords_file):
+    """Manages credentials from passwords file"""
+    
+    def __init__(self, passwords_file: str):
         self.passwords = {}
         self._load_passwords(passwords_file)
     
-    def _load_passwords(self, file_path):
+    def _load_passwords(self, file_path: str):
+        """Load passwords from file"""
         try:
             with open(file_path, 'r') as f:
                 for line in f:
                     line = line.strip()
-                    # Skip empty lines and comments
                     if not line or line.startswith('#'):
                         continue
                     if ':' in line:
@@ -89,11 +109,18 @@ class PasswordManager:
             print(f"Error reading passwords file: {e}")
             raise
     
-    def get(self, key):
+    def get(self, key: str) -> Optional[str]:
+        """Get password by key"""
         return self.passwords.get(key)
 
+# ============================================================================
+# YOUTUBE API CLIENT
+# ============================================================================
+
 class YouTubeAPI:
-    def __init__(self, client_secrets_file, refresh_token):
+    """Handles all YouTube API interactions"""
+    
+    def __init__(self, client_secrets_file: str, refresh_token: str):
         if not refresh_token:
             raise ValueError("YouTube refresh token cannot be None or empty")
             
@@ -103,13 +130,14 @@ class YouTubeAPI:
         self._load_client_secrets()
     
     def _load_client_secrets(self):
+        """Load OAuth client secrets"""
         with open(self.client_secrets_file, 'r') as f:
             secrets = json.load(f)
             client_info = secrets.get('installed', secrets.get('web', {}))
             self.client_id = client_info['client_id']
             self.client_secret = client_info['client_secret']
     
-    def refresh_access_token(self):
+    def refresh_access_token(self) -> bool:
         """Get a fresh access token using the refresh token"""
         url = "https://oauth2.googleapis.com/token"
         data = {
@@ -132,8 +160,8 @@ class YouTubeAPI:
                 print(f"Response: {e.response.text}")
             return False
     
-    def _make_api_request(self, url, method='GET', params=None, data=None):
-        """Make authenticated API request with proper error handling"""
+    def _make_api_request(self, url: str, method: str = 'GET', params: dict = None, data: dict = None):
+        """Make authenticated API request with automatic token refresh"""
         if not self.access_token:
             if not self.refresh_access_token():
                 return None
@@ -175,7 +203,7 @@ class YouTubeAPI:
             print(f"Error making API request: {e}")
             return None
     
-    def list_live_broadcasts(self):
+    def list_live_broadcasts(self) -> List[dict]:
         """List all current live broadcasts"""
         url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
         params = {
@@ -188,23 +216,150 @@ class YouTubeAPI:
             return response.get('items', [])
         return []
     
-    def find_test_stream(self):
-        """Find and return the broadcast with '{LIVESTREAM_NAME}' in title"""
+    def find_test_stream(self) -> Optional[dict]:
+        """Find and return the broadcast with LIVESTREAM_NAME in title"""
         broadcasts = self.list_live_broadcasts()
         
         for broadcast in broadcasts:
             title = broadcast['snippet']['title']
             status = broadcast['status']['lifeCycleStatus']
             
-            if LIVESTREAM_NAME.upper() in title.upper() and status == 'live':
-                print(f"Found active livestream: {title} [ID: {broadcast['id']}]")
-                return broadcast
+            if LIVESTREAM_NAME in title:
+                if status in ['created', 'ready', 'testing', 'live']:
+                    print(f"Found existing stream: {title}")
+                    print(f"  ID: {broadcast['id']}")
+                    print(f"  Status: {status}")
+                    return broadcast
         
-        print("NO ACTIVE STREAM FOUND; BUT STREAM WILL CONTINUE ANYWAYS")
         return None
     
-    def end_broadcast(self, broadcast_id):
-        """End a live broadcast by transitioning to complete status"""
+    def create_broadcast(self, title: str, start_time: datetime, category_id: str = '25') -> Optional[str]:
+        """Create a new broadcast and bind a stream to it"""
+        # Create broadcast
+        url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
+        
+        broadcast_data = {
+            "snippet": {
+                "title": title,
+                "scheduledStartTime": start_time.isoformat(),
+                "categoryId": category_id
+            },
+            "status": {
+                "privacyStatus": "public",
+                "selfDeclaredMadeForKids": False
+            },
+            "contentDetails": {
+                "enableAutoStart": False,
+                "enableAutoStop": False,
+                "enableDvr": True,
+                "recordFromStart": True,
+                "startWithSlate": False
+            }
+        }
+        
+        params = {"part": "snippet,status,contentDetails"}
+        response = self._make_api_request(url, method='POST', params=params, data=broadcast_data)
+        
+        if not response:
+            return None
+        
+        broadcast_id = response['id']
+        print(f"Created broadcast: {title}")
+        print(f"  Broadcast ID: {broadcast_id}")
+        
+        # Load and set description
+        try:
+            with open(DESCRIPTION_FILE, 'r') as f:
+                description = f.read()
+        except FileNotFoundError:
+            print(f"Description file not found: {DESCRIPTION_FILE}")
+            description = "Live stream description goes here"
+        
+        self._update_broadcast_metadata(broadcast_id, description, title, start_time.isoformat())
+        
+        # Create and bind stream
+        stream_id, stream_key = self.create_stream(title)
+        if not stream_id:
+            return None
+        
+        # Store the stream ID and key for later use
+        self.current_stream_id = stream_id
+        self.current_stream_key = stream_key
+        
+        if not self.bind_stream_to_broadcast(broadcast_id, stream_id):
+            return None
+        
+        return broadcast_id
+    
+    def _update_broadcast_metadata(self, broadcast_id: str, description: str, title: str, scheduled_start_time: str):
+        """Update broadcast with description and random thumbnail"""
+        # Update description
+        # Note: YouTube API requires all snippet fields when updating
+        url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
+        params = {
+            "part": "snippet",
+            "id": broadcast_id
+        }
+        
+        broadcast_data = {
+            "id": broadcast_id,
+            "snippet": {
+                "title": title,
+                "scheduledStartTime": scheduled_start_time,
+                "description": description
+            }
+        }
+        
+        response = self._make_api_request(url, method='PUT', params=params, data=broadcast_data)
+        if response:
+            print(f"Updated broadcast description")
+        else:
+            print(f"Warning: Failed to update broadcast description")
+        
+        # Upload random thumbnail
+        self._upload_random_thumbnail(broadcast_id)
+    
+    def _upload_random_thumbnail(self, broadcast_id: str) -> bool:
+        """Upload a random thumbnail from the thumbnails directory"""
+        try:
+            # Get list of image files
+            thumbnail_files = []
+            for ext in ['*.jpg', '*.jpeg', '*.png']:
+                thumbnail_files.extend(glob.glob(os.path.join(THUMBNAILS_DIR, ext)))
+            
+            if not thumbnail_files:
+                print(f"No thumbnail files found in {THUMBNAILS_DIR}")
+                return False
+            
+            # Select random thumbnail
+            thumbnail_path = random.choice(thumbnail_files)
+            print(f"Selected thumbnail: {os.path.basename(thumbnail_path)}")
+            
+            # Upload thumbnail
+            url = f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set"
+            params = {"videoId": broadcast_id}
+            
+            if not self.access_token:
+                if not self.refresh_access_token():
+                    return False
+            
+            headers = {
+                'Authorization': f'Bearer {self.access_token}'
+            }
+            
+            with open(thumbnail_path, 'rb') as f:
+                files = {'file': f}
+                response = requests.post(url, headers=headers, params=params, files=files)
+                response.raise_for_status()
+                print("Successfully uploaded thumbnail")
+                return True
+                
+        except Exception as e:
+            print(f"Error uploading thumbnail: {e}")
+            return False
+    
+    def end_broadcast(self, broadcast_id: str) -> bool:
+        """End a broadcast by transitioning to complete status"""
         url = "https://www.googleapis.com/youtube/v3/liveBroadcasts/transition"
         params = {
             "part": "status",
@@ -220,168 +375,9 @@ class YouTubeAPI:
             print(f"Failed to end broadcast: {broadcast_id}")
             return False
     
-    def get_random_thumbnail(self):
-        """Select a random JPG from the thumbnails directory"""
-        if not os.path.exists(THUMBNAILS_DIR):
-            print(f"Thumbnails directory not found: {THUMBNAILS_DIR}")
-            return None
-        
-        # Find all JPG files in the thumbnails directory
-        jpg_patterns = [
-            os.path.join(THUMBNAILS_DIR, "*.jpg"),
-            os.path.join(THUMBNAILS_DIR, "*.jpeg"),
-            os.path.join(THUMBNAILS_DIR, "*.JPG"),
-            os.path.join(THUMBNAILS_DIR, "*.JPEG")
-        ]
-        
-        thumbnail_files = []
-        for pattern in jpg_patterns:
-            thumbnail_files.extend(glob.glob(pattern))
-        
-        if not thumbnail_files:
-            print(f"No JPG files found in {THUMBNAILS_DIR}")
-            return None
-        
-        selected_thumbnail = random.choice(thumbnail_files)
-        print(f"Selected thumbnail: {os.path.basename(selected_thumbnail)}")
-        return selected_thumbnail
-    
-    def upload_thumbnail(self, broadcast_id, thumbnail_path):
-        """Upload a thumbnail for the broadcast"""
-        if not os.path.exists(thumbnail_path):
-            print(f"Thumbnail file not found: {thumbnail_path}")
-            return False
-        
-        try:
-            # YouTube API v3 thumbnails endpoint
-            url = f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set"
-            params = {"videoId": broadcast_id}
-            
-            headers = {
-                'Authorization': f'Bearer {self.access_token}'
-            }
-            
-            with open(thumbnail_path, 'rb') as thumbnail_file:
-                files = {'file': (os.path.basename(thumbnail_path), thumbnail_file, 'image/jpeg')}
-                
-                response = requests.post(url, headers=headers, params=params, files=files)
-                
-                if response.status_code == 200:
-                    print(f"Successfully uploaded thumbnail: {os.path.basename(thumbnail_path)}")
-                    return True
-                else:
-                    print(f"Failed to upload thumbnail: HTTP {response.status_code}")
-                    print(f"Response: {response.text}")
-                    return False
-                    
-        except Exception as e:
-            print(f"Error uploading thumbnail: {e}")
-            return False
-    
-    def set_broadcast_category(self, broadcast_id, category_id):
-        """Set the category of a broadcast using the videos.update API"""
-        try:
-            url = "https://www.googleapis.com/youtube/v3/videos"
-            params = {"part": "snippet"}
-            
-            # First, get the current video snippet
-            get_params = {"part": "snippet", "id": broadcast_id}
-            current_video = self._make_api_request(url, params=get_params)
-            
-            if not current_video or not current_video.get('items'):
-                print(f"Failed to retrieve current video data for {broadcast_id} - video may not be ready yet")
-                return False
-            
-            # Update the snippet with the new category
-            video_snippet = current_video['items'][0]['snippet']
-            video_snippet['categoryId'] = category_id
-            
-            update_data = {
-                "id": broadcast_id,
-                "snippet": video_snippet
-            }
-            
-            response = self._make_api_request(url, method='PUT', params=params, data=update_data)
-            if response:
-                print(f"Successfully updated category for broadcast {broadcast_id}")
-                return True
-            else:
-                print(f"Failed to update category for broadcast {broadcast_id}")
-                return False
-                
-        except Exception as e:
-            print(f"Exception while setting category for {broadcast_id}: {e}")
-            return False
-    
-    def create_broadcast(self, title, scheduled_start_time, category_id="28"):
-        """Create a new broadcast scheduled for future start with thumbnail and category"""
-        url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
-        params = {"part": "snippet,status,contentDetails"}
-        
-        # Load description from file
-        description = "This livestream was created using stopstarter.py.\n\n[This is a fallback description.]"  # fallback
-        try:
-            with open(DESCRIPTION_FILE, 'r', encoding='utf-8') as f:
-                description = f.read().strip()
-        except FileNotFoundError:
-            print(f"Warning: {DESCRIPTION_FILE} not found, using default description")
-        except Exception as e:
-            print(f"Warning: Error reading description file: {e}, using default description")
-        
-        broadcast_data = {
-            "snippet": {
-                "title": title,
-                "description": description,
-                "scheduledStartTime": scheduled_start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-                # NOTE: categoryId is NOT supported in liveBroadcasts.insert
-            },
-            "status": {
-                "privacyStatus": "public"
-            },
-            "contentDetails": {
-                "latencyPreference": "low",
-                "monitorStream": {
-                "enableMonitorStream": True
-            },
-            }
-        }
-        
-        response = self._make_api_request(url, method='POST', params=params, data=broadcast_data)
-        if response:
-            broadcast_id = response['id']
-            print(f"Created new broadcast: {title} [ID: {broadcast_id}]")
-            
-            # Upload random thumbnail
-            thumbnail_path = self.get_random_thumbnail()
-            if thumbnail_path:
-                self.upload_thumbnail(broadcast_id, thumbnail_path)
-            else:
-                print("No thumbnail uploaded - continuing without thumbnail")
-            
-            # Set category using videos.update API
-            if self.set_broadcast_category(broadcast_id, category_id):
-                print(f"Successfully set category to {category_id}")
-            else:
-                print(f"Warning: Failed to set category to {category_id}")
-            
-            # Create associated stream for status checking
-            stream_id, stream_key = self.create_stream(f"Stream for {title}")
-            if stream_id:
-                # Bind stream to broadcast
-                self.bind_stream_to_broadcast(broadcast_id, stream_id)
-                # Store stream ID and key for this broadcast
-                self.current_stream_id = stream_id
-                self.current_stream_key = stream_key
-            
-            return broadcast_id
-        else:
-            print(f"Failed to create broadcast: {title}")
-            return None
-    
-    def create_stream(self, title):
-        """Create a new live stream"""
+    def create_stream(self, title: str) -> Tuple[Optional[str], Optional[str]]:
+        """Create a new liveStream resource"""
         url = "https://www.googleapis.com/youtube/v3/liveStreams"
-        params = {"part": "snippet,cdn"}
         
         stream_data = {
             "snippet": {
@@ -394,7 +390,9 @@ class YouTubeAPI:
             }
         }
         
+        params = {"part": "snippet,cdn"}
         response = self._make_api_request(url, method='POST', params=params, data=stream_data)
+        
         if response:
             stream_id = response['id']
             stream_key = response['cdn']['ingestionInfo']['streamName']
@@ -404,7 +402,7 @@ class YouTubeAPI:
             print(f"Failed to create stream: {title}")
             return None, None
     
-    def bind_stream_to_broadcast(self, broadcast_id, stream_id):
+    def bind_stream_to_broadcast(self, broadcast_id: str, stream_id: str) -> bool:
         """Bind a stream to a broadcast"""
         url = "https://www.googleapis.com/youtube/v3/liveBroadcasts/bind"
         params = {
@@ -421,7 +419,7 @@ class YouTubeAPI:
             print(f"Failed to bind stream to broadcast")
             return False
     
-    def wait_for_stream_active(self, stream_id, max_wait_seconds=240):
+    def wait_for_stream_active(self, stream_id: str, max_wait_seconds: int = 240) -> bool:
         """Wait for YouTube to detect the stream as active"""
         print(f"Waiting for stream {stream_id} to become active...")
         
@@ -447,7 +445,7 @@ class YouTubeAPI:
         print(f"Stream did not become active within {max_wait_seconds} seconds")
         return False
     
-    def transition_broadcast(self, broadcast_id, target_status):
+    def transition_broadcast(self, broadcast_id: str, target_status: str) -> bool:
         """Transition broadcast to specified status"""
         url = "https://www.googleapis.com/youtube/v3/liveBroadcasts/transition"
         params = {
@@ -464,7 +462,7 @@ class YouTubeAPI:
             print(f"Failed to transition broadcast to {target_status}: {broadcast_id}")
             return False
     
-    def start_broadcast(self, broadcast_id):
+    def start_broadcast(self, broadcast_id: str) -> bool:
         """Start a broadcast by transitioning to live status"""
         url = "https://www.googleapis.com/youtube/v3/liveBroadcasts/transition"
         params = {
@@ -480,16 +478,58 @@ class YouTubeAPI:
         else:
             print(f"Failed to start broadcast: {broadcast_id}")
             return False
+    
+    def get_broadcast_status(self, broadcast_id: str) -> Optional[str]:
+        """Get current broadcast lifecycle status"""
+        url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
+        params = {
+            "part": "status",
+            "id": broadcast_id
+        }
+        
+        response = self._make_api_request(url, params=params)
+        if response and response.get('items'):
+            return response['items'][0]['status']['lifeCycleStatus']
+        return None
+
+# ============================================================================
+# OBS WEBSOCKET CLIENT
+# ============================================================================
 
 class OBSWebSocket:
-    def __init__(self, host='localhost', port=None, password=""):
+    """
+    Handles OBS WebSocket 5.x communication
+    
+    Key design decisions based on OBS behavior research:
+    - Treats stream stop as asynchronous (fire-and-forget)
+    - Expects connection drops during stop operations
+    - Reconnects gracefully when needed
+    - Doesn't wait for responses that may never come
+    """
+    
+    def __init__(self, host: str = 'localhost', port: int = None, password: str = ""):
         self.host = host
         self.port = int(port) if port is not None else None
         self.password = password
         self.socket = None
         self.authenticated = False
     
-    def connect(self):
+    def _is_connection_error(self, error: Exception) -> bool:
+        """Check if an error indicates a broken connection"""
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            return True
+        if isinstance(error, OSError):
+            # Check for specific errno values
+            if hasattr(error, 'errno') and error.errno in (
+                errno.EPIPE,      # Broken pipe
+                errno.ECONNRESET, # Connection reset by peer
+                errno.ENOTCONN,   # Socket is not connected
+                errno.ESHUTDOWN   # Cannot send after transport endpoint shutdown
+            ):
+                return True
+        return False
+    
+    def connect(self) -> bool:
         """Connect and authenticate to OBS WebSocket 5.x"""
         try:
             # Close existing connection if any
@@ -517,7 +557,7 @@ class OBSWebSocket:
             
             self.socket.send(handshake.encode())
             
-            # Read handshake response more carefully
+            # Read handshake response
             handshake_response = b""
             while b"\r\n\r\n" not in handshake_response:
                 chunk = self.socket.recv(1024)
@@ -525,11 +565,9 @@ class OBSWebSocket:
                     break
                 handshake_response += chunk
             
-            # Only decode the HTTP headers portion as UTF-8
             try:
                 response = handshake_response.decode('utf-8', errors='ignore')
             except UnicodeDecodeError:
-                # If there's still an issue, extract just the status line
                 response_lines = handshake_response.split(b'\r\n')
                 response = response_lines[0].decode('utf-8', errors='ignore')
             
@@ -583,7 +621,7 @@ class OBSWebSocket:
             print(f"Error connecting to OBS: {e}")
             return False
     
-    def _send_message(self, message_data):
+    def _send_message(self, message_data: dict):
         """Send WebSocket message with proper framing"""
         message = json.dumps(message_data)
         message_bytes = message.encode('utf-8')
@@ -611,8 +649,8 @@ class OBSWebSocket:
         
         self.socket.send(bytes(frame))
     
-    def _receive_message(self):
-        """Receive and parse WebSocket message with proper frame parsing"""
+    def _receive_message(self) -> Optional[dict]:
+        """Receive and parse WebSocket message"""
         try:
             self.socket.settimeout(5)
             response_data = self.socket.recv(4096)
@@ -641,7 +679,7 @@ class OBSWebSocket:
                 payload_len = struct.unpack('>Q', response_data[2:10])[0]
                 header_length = 10
             
-            # Handle masking (shouldn't be present in server-to-client frames, but check anyway)
+            # Handle masking
             if mask_bit:
                 if len(response_data) < header_length + 4:
                     return None
@@ -652,7 +690,6 @@ class OBSWebSocket:
             
             # Extract payload
             if len(response_data) < payload_start + payload_len:
-                # Need more data, try to receive more
                 remaining_bytes = payload_start + payload_len - len(response_data)
                 try:
                     additional_data = self.socket.recv(remaining_bytes)
@@ -669,21 +706,30 @@ class OBSWebSocket:
                     unmasked_payload.append(payload_data[i] ^ mask_key[i % 4])
                 payload_data = bytes(unmasked_payload)
             
-            # Decode payload as UTF-8 and parse JSON
+            # Decode and parse JSON
             payload_str = payload_data.decode('utf-8')
             return json.loads(payload_str)
             
         except (socket.timeout, json.JSONDecodeError, UnicodeDecodeError):
-            # Silently return None for common parsing issues to avoid spam
             return None
         except Exception as e:
-            print(f"Unexpected error receiving message: {e}")
+            if self._is_connection_error(e):
+                self.authenticated = False
             return None
     
-    def send_request(self, request_type, request_data=None, max_retries=3, retry_delay=2):
-        """Send request to OBS using WebSocket 5.x format with retry logic"""
+    def send_request(self, request_type: str, request_data: dict = None, 
+                    expect_response: bool = True, max_retries: int = 3) -> bool:
+        """
+        Send request to OBS
+        
+        Args:
+            request_type: OBS request type (e.g., "StartStream")
+            request_data: Optional request data
+            expect_response: If False, don't wait for response (fire-and-forget)
+            max_retries: Number of retry attempts
+        """
         if not self.authenticated:
-            print("Not authenticated to OBS WebSocket")
+            print(f"Not authenticated to OBS WebSocket")
             return False
         
         for attempt in range(1, max_retries + 1):
@@ -702,20 +748,25 @@ class OBSWebSocket:
                 
                 self._send_message(message)
                 
-                # Wait for response with timeout
+                # For fire-and-forget requests, just send and return
+                if not expect_response:
+                    print(f"OBS command sent (no response expected): {request_type}")
+                    time.sleep(0.2)  # Brief pause to let OBS process
+                    return True
+                
+                # Wait for response
                 start_time = time.time()
-                timeout = 10  # 10 second timeout per attempt
+                timeout = 10
                 
                 while time.time() - start_time < timeout:
                     response = self._receive_message()
                     
                     if not response:
-                        time.sleep(0.1)  # Brief pause before checking again
+                        time.sleep(0.1)
                         continue
                     
                     if response.get('op') == 7:  # RequestResponse
                         request_status = response.get('d', {}).get('requestStatus', {})
-                        response_data = response.get('d', {}).get('responseData', {})
                         
                         if request_status.get('result'):
                             if attempt > 1:
@@ -727,46 +778,88 @@ class OBSWebSocket:
                             error_code = request_status.get('code', 'UNKNOWN')
                             error_comment = request_status.get('comment', 'No error message')
                             print(f"OBS command failed: {request_type}")
-                            print(f"  Error code: {error_code}")
-                            print(f"  Error message: {error_comment}")
-                            if response_data:
-                                print(f"  Response data: {response_data}")
+                            print(f"  Error: {error_comment} (code: {error_code})")
                             
                             # Don't retry on certain error codes
-                            if error_code in [600, 601, 602]:  # Request errors that won't be fixed by retry
-                                print(f"  Non-retryable error, aborting")
+                            if error_code in [600, 601, 602]:
                                 return False
-                            
-                            # Otherwise, will retry if attempts remain
                             break
-                    elif response.get('op') == 5:  # Event - ignore and continue waiting
+                    elif response.get('op') == 5:  # Event - ignore
                         continue
                 
-                # If we get here, timeout occurred
-                print(f"No response received for: {request_type} (attempt {attempt}/{max_retries})")
+                # Timeout or error occurred
+                if not self.authenticated:
+                    print(f"Connection lost during {request_type}")
+                    if attempt < max_retries:
+                        print("Attempting to reconnect...")
+                        if self.connect():
+                            print("Reconnected, retrying request...")
+                        else:
+                            print("Reconnection failed")
+                else:
+                    print(f"No response for: {request_type} (attempt {attempt}/{max_retries})")
                 
             except Exception as e:
-                print(f"Exception during OBS request {request_type} (attempt {attempt}/{max_retries}): {e}")
+                if self._is_connection_error(e):
+                    print(f"Connection error during {request_type}: {e}")
+                    self.authenticated = False
+                    if attempt < max_retries:
+                        print("Attempting to reconnect...")
+                        if self.connect():
+                            print("Reconnected, retrying request...")
+                        else:
+                            print("Reconnection failed")
+                else:
+                    print(f"Error during {request_type}: {e}")
             
-            # Retry logic
             if attempt < max_retries:
-                print(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-            else:
-                print(f"All {max_retries} attempts failed for: {request_type}")
-                return False
+                time.sleep(2)
         
+        print(f"All {max_retries} attempts failed for: {request_type}")
         return False
     
-    def stop_streaming(self):
-        """Stop OBS streaming"""
-        return self.send_request("StopStream")
+    def stop_streaming(self) -> bool:
+        """
+        Stop OBS streaming
+        
+        Uses fire-and-forget approach because OBS often closes connection
+        during stop operation. This is expected behavior.
+        """
+        try:
+            request_id = str(int(time.time() * 1000))
+            message = {
+                "op": 6,
+                "d": {
+                    "requestType": "StopStream",
+                    "requestId": request_id
+                }
+            }
+            
+            # Send the message
+            self._send_message(message)
+            print("OBS command sent: StopStream (fire-and-forget)")
+            
+            # Give OBS a moment to process
+            time.sleep(0.5)
+            
+            # Connection might be closed by OBS - this is normal
+            return True
+            
+        except Exception as e:
+            if self._is_connection_error(e):
+                print("Connection closed during StopStream (this is expected)")
+                self.authenticated = False
+                return True  # Still consider this success
+            else:
+                print(f"Error during StopStream: {e}")
+                return False
     
-    def start_streaming(self):
+    def start_streaming(self) -> bool:
         """Start OBS streaming"""
-        return self.send_request("StartStream")
+        return self.send_request("StartStream", expect_response=True)
     
-    def set_stream_settings(self, stream_key, server_url="rtmp://a.rtmp.youtube.com/live2"):
+    def set_stream_settings(self, stream_key: str, 
+                           server_url: str = "rtmp://a.rtmp.youtube.com/live2") -> bool:
         """Update OBS stream settings"""
         stream_settings = {
             "streamServiceType": "rtmp_custom",
@@ -777,34 +870,47 @@ class OBSWebSocket:
         }
         return self.send_request("SetStreamServiceSettings", stream_settings)
     
-    def get_stream_status(self):
-        """Get OBS streaming status"""
-        request_id = str(int(time.time() * 1000))
-        message = {
-            "op": 6,  # Request
-            "d": {
-                "requestType": "GetStreamStatus",
-                "requestId": request_id
+    def get_stream_status(self) -> bool:
+        """
+        Get OBS streaming status
+        
+        Returns True if streaming, False otherwise
+        """
+        if not self.authenticated:
+            return False
+        
+        try:
+            request_id = str(int(time.time() * 1000))
+            message = {
+                "op": 6,
+                "d": {
+                    "requestType": "GetStreamStatus",
+                    "requestId": request_id
+                }
             }
-        }
-        
-        self._send_message(message)
-        
-        # Keep receiving messages until we get the response
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            response = self._receive_message()
             
-            if not response:
-                continue
+            self._send_message(message)
+            
+            # Wait for response
+            for _ in range(10):  # Try for ~5 seconds
+                response = self._receive_message()
                 
-            if response.get('op') == 7:  # RequestResponse
-                response_data = response.get('d', {}).get('responseData', {})
-                return response_data.get('outputActive', False)
-            elif response.get('op') == 5:  # Event - ignore and continue waiting
-                continue
-        
-        return False  # Assume not streaming if we can't get status
+                if not response:
+                    time.sleep(0.5)
+                    continue
+                
+                if response.get('op') == 7:  # RequestResponse
+                    response_data = response.get('d', {}).get('responseData', {})
+                    return response_data.get('outputActive', False)
+                elif response.get('op') == 5:  # Event - ignore
+                    continue
+            
+            return False
+            
+        except Exception as e:
+            if self._is_connection_error(e):
+                self.authenticated = False
+            return False
     
     def close(self):
         """Close connection"""
@@ -817,12 +923,26 @@ class OBSWebSocket:
                 self.socket = None
                 self.authenticated = False
 
+# ============================================================================
+# STREAM SCHEDULER
+# ============================================================================
+
 class StreamScheduler:
+    """
+    Main scheduler class that coordinates OBS and YouTube
+    
+    Key improvements in this version:
+    - Treats OBS stop as async operation
+    - Reconnects automatically when needed
+    - Verifies completion rather than waiting for responses
+    - Handles OBS connection drops gracefully
+    """
+    
     def __init__(self):
         # Load credentials
         self.passwords = PasswordManager(PASSWORDS_FILE)
         
-        # Validate required credentials
+        # Validate credentials
         refresh_token = self.passwords.get('YOUTUBE_REFRESH_TOKEN')
         if not refresh_token:
             raise ValueError("YOUTUBE_REFRESH_TOKEN not found in passwords.txt")
@@ -831,68 +951,77 @@ class StreamScheduler:
         if not obs_port:
             raise ValueError("OBS_WEBSOCKET_PORT not found in passwords.txt")
         
-        # Get category ID from configuration
-        self.category_id = YOUTUBE_CATEGORY_ID
-        
         # Initialize APIs
+        self.category_id = YOUTUBE_CATEGORY_ID
         self.youtube = YouTubeAPI(CLIENT_SECRETS_FILE, refresh_token)
-        
         self.obs = OBSWebSocket(
             password=self.passwords.get('OBS_WEBSOCKET_PASSWORD'),
             port=int(obs_port)
         )
         
-        # Convert schedule sets to events
+        # Convert schedule to events
         self.events = self._create_events_from_schedule()
         
         # State
         self.current_broadcast_id = None
-        self.next_broadcast_id = None
         self.current_stream_id = None
+        self.next_broadcast_id = None
         self.next_stream_id = None
-        self.current_stream_key = None
         self.next_stream_key = None
     
     def _create_events_from_schedule(self) -> List[ScheduledEvent]:
-        """Convert SCHEDULE_SETS to ScheduledEvent objects"""
+        """Convert schedule sets into list of events"""
         events = []
         
         for stop_time_str, start_time_str in SCHEDULE_SETS:
-            # Parse times
             stop_hour, stop_minute = parse_time_string(stop_time_str)
             start_hour, start_minute = parse_time_string(start_time_str)
             
             stop_time = dt_time(stop_hour, stop_minute, 0)
             start_time = dt_time(start_hour, start_minute, 0)
-            # Create stop event
-            events.append(ScheduledEvent("STOP", stop_time, start_time))
             
-            # Create start event (early start time)
-            start_datetime = datetime.combine(datetime.today(), start_time)
-            early_start_datetime = start_datetime - timedelta(seconds=START_EARLY_SECONDS)
-            early_start_time = early_start_datetime.time()
+            # STOP event happens a few seconds before START
+            actual_stop_time = dt_time(stop_hour, stop_minute, 60 - START_EARLY_SECONDS)
             
-            events.append(ScheduledEvent("START", early_start_time, start_time))
+            events.append(ScheduledEvent("STOP", actual_stop_time, start_time))
+            events.append(ScheduledEvent("START", start_time, start_time))
         
         return events
     
     def get_next_event(self, from_datetime: datetime) -> Tuple[Optional[ScheduledEvent], Optional[datetime]]:
-        """Get the next event and when it occurs"""
-        upcoming_events = []
+        """Get the next event after specified datetime"""
+        next_events = []
         
         for event in self.events:
             next_occurrence = event.get_next_occurrence(from_datetime)
-            upcoming_events.append((event, next_occurrence))
+            next_events.append((event, next_occurrence))
         
-        # Sort by occurrence time
-        upcoming_events.sort(key=lambda x: x[1])
+        if not next_events:
+            return None, None
         
-        if upcoming_events:
-            return upcoming_events[0]
-        return None, None
+        next_events.sort(key=lambda x: x[1])
+        return next_events[0]
     
-    def initialize(self):
-        """Find current LIVESTREAM_NAME and prepare for management"""
+    def ensure_obs_connection(self) -> bool:
+        """Ensure OBS connection is active, reconnect if needed"""
+        if not self.obs.authenticated:
+            print("OBS not connected, attempting to connect...")
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                if self.obs.connect():
+                    print("Successfully connected to OBS")
+                    return True
+                else:
+                    if attempt < max_attempts:
+                        print(f"Connection attempt {attempt} failed, retrying in 3 seconds...")
+                        time.sleep(3)
+            
+            print("Failed to connect to OBS after all attempts")
+            return False
+        return True
+    
+    def initialize(self) -> bool:
+        """Initialize connections and find current stream"""
         print("Initializing stream scheduler...")
         
         # Connect to OBS
@@ -900,7 +1029,7 @@ class StreamScheduler:
             print("Failed to connect to OBS WebSocket")
             return False
         
-        # Find current LIVESTREAM_NAME
+        # Find current stream
         test_stream = self.youtube.find_test_stream()
         if test_stream:
             self.current_broadcast_id = test_stream['id']
@@ -910,31 +1039,54 @@ class StreamScheduler:
         
         return True
     
-    def _wait_for_obs_stop(self):
-        """Wait for OBS to fully stop streaming before proceeding"""
-        max_wait_time = 30  # Maximum 30 seconds
-        wait_interval = 2   # Check every 2 seconds
+    def wait_for_obs_stop(self):
+        """
+        Wait for OBS to fully stop streaming
+        
+        Uses polling with automatic reconnection since OBS may have
+        closed connection during stop operation
+        """
+        max_wait_time = 30
+        wait_interval = 2
+        
+        print("Verifying OBS has stopped streaming...")
         
         for i in range(max_wait_time // wait_interval):
-            if self.obs.get_stream_status():
-                print(f"OBS still streaming, waiting... ({i+1})")
-                time.sleep(wait_interval)
-            else:
-                print("OBS has stopped streaming")
+            # Ensure we're connected before checking
+            if not self.ensure_obs_connection():
+                print("Cannot verify OBS status - assuming stopped")
+                return
+            
+            try:
+                if self.obs.get_stream_status():
+                    print(f"OBS still streaming, waiting... ({i+1})")
+                    time.sleep(wait_interval)
+                else:
+                    print("OBS has stopped streaming")
+                    return
+            except Exception as e:
+                print(f"Error checking OBS status: {e}")
+                # Can't check, assume stopped
                 return
         
-        print("Timeout waiting for OBS to stop streaming, proceeding anyway...")
+        print("Wait timeout - proceeding anyway")
     
     def stop_current_stream(self):
-        """Stop current stream and prepare for next"""
+        """
+        Stop current stream and prepare for next
+        
+        Optimized approach:
+        1. Tell OBS to stop (fire-and-forget)
+        2. End YouTube broadcast (independent)
+        3. Verify OBS actually stopped (with reconnection)
+        """
         print("Stopping current stream...")
         
-        # Step 1: Stop OBS streaming first
-        success = self.obs.stop_streaming()
-        if not success:
-            print("Failed to stop OBS streaming")
+        # Step 1: Tell OBS to stop
+        # Don't wait for response - OBS often closes connection during stop
+        self.obs.stop_streaming()
         
-        # Step 2: End YouTube broadcast
+        # Step 2: End YouTube broadcast (independent of OBS)
         if self.current_broadcast_id:
             success = self.youtube.end_broadcast(self.current_broadcast_id)
             if success:
@@ -944,14 +1096,18 @@ class StreamScheduler:
         
         print("Stream stop sequence completed")
         
-        # Step 3: Wait for OBS to fully stop streaming
-        print("Waiting for OBS to fully stop streaming...")
-        self._wait_for_obs_stop()
-        print("OBS ready for next stream")
+        # Step 3: Verify OBS actually stopped (with reconnection if needed)
+        self.wait_for_obs_stop()
+        print("Ready for next stream")
     
-    def start_obs_with_key(self, stream_key):
+    def start_obs_with_key(self, stream_key: str) -> bool:
         """Configure OBS with stream key and start streaming"""
         print(f"Configuring OBS with stream key...")
+        
+        # Ensure connection
+        if not self.ensure_obs_connection():
+            print("Failed to ensure OBS connection")
+            return False
         
         if not self.obs.set_stream_settings(stream_key):
             print("Failed to configure OBS with stream key")
@@ -965,11 +1121,11 @@ class StreamScheduler:
         print("OBS streaming started successfully!")
         return True
     
-    def create_next_stream(self, target_start_time: dt_time):
+    def create_next_stream(self, target_start_time: dt_time) -> bool:
         """Create the next scheduled stream"""
         now = datetime.now(timezone.utc)
         
-        # Calculate the next occurrence of this start time
+        # Calculate next occurrence
         next_start = datetime.combine(now.date(), target_start_time, timezone.utc)
         if next_start <= now:
             next_start += timedelta(days=1)
@@ -988,11 +1144,11 @@ class StreamScheduler:
         self.next_broadcast_id = self.youtube.create_broadcast(title, next_start, self.category_id)
         
         if self.next_broadcast_id:
-            # Store the stream ID and key from the created broadcast
+            # Store stream ID and key
             self.next_stream_id = getattr(self.youtube, 'current_stream_id', None)
             self.next_stream_key = getattr(self.youtube, 'current_stream_key', None)
             
-            # Immediately configure and start OBS with the new key
+            # Configure and start OBS with new key
             if self.next_stream_key:
                 if not self.start_obs_with_key(self.next_stream_key):
                     print("Failed to start OBS with new stream key")
@@ -1004,31 +1160,29 @@ class StreamScheduler:
             print("Failed to create next stream")
             return False
     
-    def start_next_stream(self):
+    def start_next_stream(self) -> bool:
         """Start the next YouTube broadcast with retry logic"""
         if not self.next_broadcast_id:
             print("No next broadcast to start")
             return False
         
-        # OBS is already streaming with the correct key from create_next_stream()
-        # No need to verify - proceed directly to waiting for YouTube stream detection
-        
-        # Wait for YouTube to detect the stream as active
+        # OBS is already streaming from create_next_stream()
+        # Wait for YouTube to detect stream
         if self.next_stream_id and self.youtube.wait_for_stream_active(self.next_stream_id):
-            # First transition to testing if in ready status
-            if self._get_broadcast_status(self.next_broadcast_id) == 'ready':
-                print("Broadcast is in 'ready' status, transitioning to 'testing' first...")
+            # Transition to testing if needed
+            if self.youtube.get_broadcast_status(self.next_broadcast_id) == 'ready':
+                print("Transitioning to 'testing' status...")
                 if self.youtube.transition_broadcast(self.next_broadcast_id, 'testing'):
-                    print("Successfully transitioned to testing status")
-                    time.sleep(10)  # Brief pause between transitions
+                    print("Successfully transitioned to testing")
+                    time.sleep(10)
                 else:
-                    print("Failed to transition to testing status")
+                    print("Failed to transition to testing")
                     return False
             
             # Retry logic for testing to live transition
             max_attempts = 30
             for attempt in range(1, max_attempts + 1):
-                print(f"Attempting to transition to live (attempt {attempt}/{max_attempts})")
+                print(f"Attempting to go live (attempt {attempt}/{max_attempts})")
                 success = self.youtube.start_broadcast(self.next_broadcast_id)
                 
                 if success:
@@ -1036,7 +1190,7 @@ class StreamScheduler:
                     self.current_stream_id = self.next_stream_id
                     self.next_broadcast_id = None
                     self.next_stream_id = None
-                    print("Next stream is now live")
+                    print("Stream is now live!")
                     return True
                 else:
                     print(f"Transition attempt {attempt} failed")
@@ -1044,28 +1198,15 @@ class StreamScheduler:
                         print("Waiting 10 seconds before retry...")
                         time.sleep(10)
             
-            # If we get here, all attempts failed
-            print("catastrophic error - unable to transition from testing to live")
+            # All attempts failed
+            print("CRITICAL ERROR - unable to transition to live")
             exit(1)
         
-        print("Failed to start broadcast - stream not active or API call failed")
+        print("Failed to start broadcast - stream not active")
         return False
     
-    def _get_broadcast_status(self, broadcast_id):
-        """Get current broadcast lifecycle status"""
-        url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
-        params = {
-            "part": "status",
-            "id": broadcast_id
-        }
-        
-        response = self.youtube._make_api_request(url, params=params)
-        if response and response.get('items'):
-            return response['items'][0]['status']['lifeCycleStatus']
-        return None
-    
     def run_schedule(self):
-        """Main scheduling loop with event-based timing and low-activity mode"""
+        """Main scheduling loop with event-based timing"""
         print(f"Stream scheduler running with {len(SCHEDULE_SETS)} daily schedule sets:")
         for i, (stop_time_str, start_time_str) in enumerate(SCHEDULE_SETS):
             print(f"  SET {i+1}: {stop_time_str} -> {start_time_str} UTC")
@@ -1083,9 +1224,9 @@ class StreamScheduler:
                 if next_event and event_time:
                     time_until_event = (event_time - now).total_seconds()
                     
-                    # Check if we should enter low-activity mode
-                    if time_until_event > 3 * 60 * 60:  # More than 3 hours until next event
-                        print(f"Next event in {time_until_event/3600:.1f} hours - entering low-activity mode (30-minute intervals)")
+                    # Low-activity mode for long waits
+                    if time_until_event > 3 * 60 * 60:  # More than 3 hours
+                        print(f"Next event in {time_until_event/3600:.1f} hours - entering low-activity mode")
                         time.sleep(30 * 60)  # 30 minutes
                         continue
                     
@@ -1103,7 +1244,7 @@ class StreamScheduler:
                                 self.start_next_stream()
                             time.sleep(15)  # Prevent duplicate execution
                     
-                    # Adaptive sleep timing (for periods closer to events)
+                    # Adaptive sleep timing
                     elif time_until_event <= 30:
                         time.sleep(0)  # High precision
                     elif time_until_event <= 300:  # 5 minutes
@@ -1119,9 +1260,21 @@ class StreamScheduler:
                 print("Continuing...")
                 time.sleep(5)
 
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
 def main():
-    print("24/7 Automated Livestream Relay System v0.23")
+    print("=" * 70)
+    print("24/7 Automated Livestream Relay System v2.0")
     print("Python3 + OBS WebSocket 5.1 + YouTube API v3")
+    print()
+    print("REWRITTEN VERSION - October 2025")
+    print("- Optimized for OBS WebSocket behavior")
+    print("- Fire-and-forget stop operations")
+    print("- Graceful connection handling")
+    print("- Defensive programming throughout")
+    print("=" * 70)
     print()
     
     scheduler = None
@@ -1137,7 +1290,7 @@ def main():
     except KeyboardInterrupt:
         print("\nShutting down...")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Fatal error: {e}")
         raise
     finally:
         # Cleanup
