@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 YouTube Stream Scheduler with OBS WebSocket 5.x Integration
-Automatically manages YouTube live stream lifecycle with proper API calls
 """
 
 import json
@@ -27,8 +26,8 @@ LIVESTREAM_NAME = "LIVESTREAM"
 
 # Schedule sets: (STOP_TIME, START_TIME) in 24-hour format with leading zeros
 SCHEDULE_SETS = [
-    ("11:56", "12:00"),
-    ("23:56", "00:00"),
+    ("11:55", "12:00"),
+    ("23:55", "00:00"),
 ]
 
 # Schedule timing tolerance in seconds
@@ -37,7 +36,7 @@ SCHEDULE_TOLERANCE_SECONDS = 10
 # How many seconds before scheduled start time to begin going live
 START_EARLY_SECONDS = 2
 
-# YouTube video category ID (25 = News & Politics)
+# YouTube video category ID (25 = News & Politics; 28 = Science & Technology)
 YOUTUBE_CATEGORY_ID = "28"
 
 # ============================================================================
@@ -293,8 +292,7 @@ class YouTubeAPI:
     
     def _update_broadcast_metadata(self, broadcast_id: str, description: str, title: str, scheduled_start_time: str):
         """Update broadcast with description and random thumbnail"""
-        # Update description
-        # Note: YouTube API requires all snippet fields when updating
+        # Update description (requires all required snippet fields)
         url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
         params = {
             "part": "snippet",
@@ -500,11 +498,10 @@ class OBSWebSocket:
     """
     Handles OBS WebSocket 5.x communication
     
-    Key design decisions based on OBS behavior research:
-    - Treats stream stop as asynchronous (fire-and-forget)
-    - Expects connection drops during stop operations
-    - Reconnects gracefully when needed
-    - Doesn't wait for responses that may never come
+    Design considerations:
+    - Stream stop operations use fire-and-forget to avoid waiting for responses
+    - Connection drops during stop are expected and handled gracefully
+    - Automatic reconnection when connection is lost
     """
     
     def __init__(self, host: str = 'localhost', port: int = None, password: str = ""):
@@ -720,13 +717,13 @@ class OBSWebSocket:
     def send_request(self, request_type: str, request_data: dict = None, 
                     expect_response: bool = True, max_retries: int = 3) -> bool:
         """
-        Send request to OBS
+        Send request to OBS WebSocket
         
         Args:
             request_type: OBS request type (e.g., "StartStream")
-            request_data: Optional request data
-            expect_response: If False, don't wait for response (fire-and-forget)
-            max_retries: Number of retry attempts
+            request_data: Optional request parameters
+            expect_response: If False, send command without waiting for response
+            max_retries: Number of retry attempts on failure
         """
         if not self.authenticated:
             print(f"Not authenticated to OBS WebSocket")
@@ -748,7 +745,7 @@ class OBSWebSocket:
                 
                 self._send_message(message)
                 
-                # For fire-and-forget requests, just send and return
+                # For commands that don't need responses, return immediately
                 if not expect_response:
                     print(f"OBS command sent (no response expected): {request_type}")
                     time.sleep(0.2)  # Brief pause to let OBS process
@@ -820,10 +817,10 @@ class OBSWebSocket:
     
     def stop_streaming(self) -> bool:
         """
-        Stop OBS streaming
+        Stop OBS streaming using fire-and-forget approach
         
-        Uses fire-and-forget approach because OBS often closes connection
-        during stop operation. This is expected behavior.
+        OBS often closes the connection during stop operations, so we send
+        the command without waiting for a response.
         """
         try:
             request_id = str(int(time.time() * 1000))
@@ -837,19 +834,19 @@ class OBSWebSocket:
             
             # Send the message
             self._send_message(message)
-            print("OBS command sent: StopStream (fire-and-forget)")
+            print("OBS command sent: StopStream")
             
-            # Give OBS a moment to process
+            # Allow time for OBS to process
             time.sleep(0.5)
             
-            # Connection might be closed by OBS - this is normal
+            # Connection may be closed by OBS during this operation
             return True
             
         except Exception as e:
             if self._is_connection_error(e):
-                print("Connection closed during StopStream (this is expected)")
+                print("Connection closed during StopStream")
                 self.authenticated = False
-                return True  # Still consider this success
+                return True  # Still consider this successful
             else:
                 print(f"Error during StopStream: {e}")
                 return False
@@ -874,7 +871,7 @@ class OBSWebSocket:
         """
         Get OBS streaming status
         
-        Returns True if streaming, False otherwise
+        Returns True if currently streaming, False otherwise.
         """
         if not self.authenticated:
             return False
@@ -929,13 +926,10 @@ class OBSWebSocket:
 
 class StreamScheduler:
     """
-    Main scheduler class that coordinates OBS and YouTube
+    Main scheduler that coordinates OBS and YouTube operations
     
-    Key improvements in this version:
-    - Treats OBS stop as async operation
-    - Reconnects automatically when needed
-    - Verifies completion rather than waiting for responses
-    - Handles OBS connection drops gracefully
+    Handles scheduled stream start/stop events, manages broadcast lifecycle,
+    and maintains persistent connections with automatic recovery.
     """
     
     def __init__(self):
@@ -1043,13 +1037,13 @@ class StreamScheduler:
         """
         Wait for OBS to fully stop streaming
         
-        Uses polling with automatic reconnection since OBS may have
-        closed connection during stop operation
+        Polls stream status with automatic reconnection since OBS may have
+        closed the connection during the stop operation.
         """
         max_wait_time = 30
         wait_interval = 2
         
-        print("Verifying OBS has stopped streaming...")
+        print("Verifying OBS has stopped...")
         
         for i in range(max_wait_time // wait_interval):
             # Ensure we're connected before checking
@@ -1075,18 +1069,17 @@ class StreamScheduler:
         """
         Stop current stream and prepare for next
         
-        Optimized approach:
-        1. Tell OBS to stop (fire-and-forget)
-        2. End YouTube broadcast (independent)
-        3. Verify OBS actually stopped (with reconnection)
+        Process:
+        1. Send stop command to OBS (fire-and-forget)
+        2. End YouTube broadcast
+        3. Verify OBS has stopped (with reconnection if needed)
         """
         print("Stopping current stream...")
         
-        # Step 1: Tell OBS to stop
-        # Don't wait for response - OBS often closes connection during stop
+        # Step 1: Send stop command to OBS
         self.obs.stop_streaming()
         
-        # Step 2: End YouTube broadcast (independent of OBS)
+        # Step 2: End YouTube broadcast
         if self.current_broadcast_id:
             success = self.youtube.end_broadcast(self.current_broadcast_id)
             if success:
@@ -1096,7 +1089,7 @@ class StreamScheduler:
         
         print("Stream stop sequence completed")
         
-        # Step 3: Verify OBS actually stopped (with reconnection if needed)
+        # Step 3: Verify OBS has stopped
         self.wait_for_obs_stop()
         print("Ready for next stream")
     
@@ -1166,8 +1159,8 @@ class StreamScheduler:
             print("No next broadcast to start")
             return False
         
-        # OBS is already streaming from create_next_stream()
-        # Wait for YouTube to detect stream
+        # OBS is already streaming with the correct key
+        # Wait for YouTube to detect the stream as active
         if self.next_stream_id and self.youtube.wait_for_stream_active(self.next_stream_id):
             # Transition to testing if needed
             if self.youtube.get_broadcast_status(self.next_broadcast_id) == 'ready':
@@ -1226,20 +1219,20 @@ class StreamScheduler:
                     
                     # Low-activity mode for long waits
                     if time_until_event > 3 * 60 * 60:  # More than 3 hours
-                        print(f"Next event in {time_until_event/3600:.1f} hours - entering low-activity mode")
+                        print(f"\rNext event in {time_until_event/3600:.1f} hours - entering low-activity mode    ", end='', flush=True)
                         time.sleep(30 * 60)  # 30 minutes
                         continue
                     
                     # Execute if it's time
                     if time_until_event <= SCHEDULE_TOLERANCE_SECONDS:
                         if next_event.event_type == "STOP":
-                            print(f"Executing STOP event")
+                            print(f"\nExecuting STOP event")
                             self.stop_current_stream()
                             self.create_next_stream(next_event.original_start_time)
                             time.sleep(15)  # Prevent duplicate execution
                         elif next_event.event_type == "START":
                             print()
-                            print(f"Executing START event")
+                            print(f"\nExecuting START event")
                             if self.next_broadcast_id:
                                 self.start_next_stream()
                             time.sleep(15)  # Prevent duplicate execution
@@ -1266,14 +1259,8 @@ class StreamScheduler:
 
 def main():
     print("=" * 70)
-    print("24/7 Automated Livestream Relay System v2.0")
+    print("24/7 Automated Livestream Relay System")
     print("Python3 + OBS WebSocket 5.1 + YouTube API v3")
-    print()
-    print("REWRITTEN VERSION - October 2025")
-    print("- Optimized for OBS WebSocket behavior")
-    print("- Fire-and-forget stop operations")
-    print("- Graceful connection handling")
-    print("- Defensive programming throughout")
     print("=" * 70)
     print()
     
