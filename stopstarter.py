@@ -39,6 +39,17 @@ START_EARLY_SECONDS = 2
 # YouTube video category ID (25 = News & Politics; 28 = Science & Technology)
 YOUTUBE_CATEGORY_ID = "28"
 
+# Timeouts for YouTube API calls: (connect seconds, read seconds)
+HTTP_TIMEOUT = (10, 30)
+UPLOAD_TIMEOUT = (10, 120)
+
+# Delay between retries after a failed stream setup or go-live; doubles each time
+RETRY_DELAY_MIN_SECONDS = 60
+RETRY_DELAY_MAX_SECONDS = 30 * 60
+
+# Go-live attempts per retry after the first failure (each attempt uses API quota)
+RETRY_GO_LIVE_ATTEMPTS = 5
+
 # ============================================================================
 # FILE PATHS
 # ============================================================================
@@ -147,7 +158,7 @@ class YouTubeAPI:
         }
         
         try:
-            response = requests.post(url, data=data)
+            response = requests.post(url, data=data, timeout=HTTP_TIMEOUT)
             response.raise_for_status()
             token_data = response.json()
             self.access_token = token_data['access_token']
@@ -155,7 +166,8 @@ class YouTubeAPI:
             return True
         except requests.RequestException as e:
             print(f"Error refreshing access token: {e}")
-            if hasattr(e, 'response') and e.response:
+            # A Response object is falsy for 4xx/5xx, so compare against None
+            if getattr(e, 'response', None) is not None:
                 print(f"Response: {e.response.text}")
             return False
     
@@ -172,17 +184,17 @@ class YouTubeAPI:
         
         try:
             if method == 'GET':
-                response = requests.get(url, headers=headers, params=params)
+                response = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
             elif method == 'POST':
                 if data:
-                    response = requests.post(url, headers=headers, params=params, json=data)
+                    response = requests.post(url, headers=headers, params=params, json=data, timeout=HTTP_TIMEOUT)
                 else:
-                    response = requests.post(url, headers=headers, params=params)
+                    response = requests.post(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
             elif method == 'PUT':
                 if data:
-                    response = requests.put(url, headers=headers, params=params, json=data)
+                    response = requests.put(url, headers=headers, params=params, json=data, timeout=HTTP_TIMEOUT)
                 else:
-                    response = requests.put(url, headers=headers, params=params)
+                    response = requests.put(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
@@ -202,12 +214,13 @@ class YouTubeAPI:
             print(f"Error making API request: {e}")
             return None
     
-    def list_live_broadcasts(self) -> List[dict]:
-        """List all current live broadcasts"""
+    def list_live_broadcasts(self, broadcast_status: str) -> List[dict]:
+        """List broadcasts with the given status ('active' or 'upcoming')"""
         url = "https://www.googleapis.com/youtube/v3/liveBroadcasts"
         params = {
             "part": "id,snippet,status",
-            "mine": "true"
+            "broadcastStatus": broadcast_status,
+            "maxResults": 50
         }
         
         response = self._make_api_request(url, params=params)
@@ -217,7 +230,8 @@ class YouTubeAPI:
     
     def find_test_stream(self) -> Optional[dict]:
         """Find and return the broadcast with LIVESTREAM_NAME in title"""
-        broadcasts = self.list_live_broadcasts()
+        # Check running broadcasts first so a live stream wins over an upcoming one
+        broadcasts = self.list_live_broadcasts('active') + self.list_live_broadcasts('upcoming')
         
         for broadcast in broadcasts:
             title = broadcast['snippet']['title']
@@ -347,7 +361,7 @@ class YouTubeAPI:
             
             with open(thumbnail_path, 'rb') as f:
                 files = {'file': f}
-                response = requests.post(url, headers=headers, params=params, files=files)
+                response = requests.post(url, headers=headers, params=params, files=files, timeout=UPLOAD_TIMEOUT)
                 response.raise_for_status()
                 print("Successfully uploaded thumbnail")
                 return True
@@ -510,16 +524,20 @@ class OBSWebSocket:
         self.password = password
         self.socket = None
         self.authenticated = False
+        self._buffer = bytearray()  # Bytes received but not yet parsed into a frame
+        self._message = bytearray()  # Payload of a message arriving in several frames
+        self._request_counter = 0
     
     def _is_connection_error(self, error: Exception) -> bool:
         """Check if an error indicates a broken connection"""
-        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+        if isinstance(error, ConnectionError):  # Includes aborted connections on Windows
             return True
         if isinstance(error, OSError):
             # Check for specific errno values
             if hasattr(error, 'errno') and error.errno in (
                 errno.EPIPE,      # Broken pipe
                 errno.ECONNRESET, # Connection reset by peer
+                errno.ECONNABORTED, # Connection aborted
                 errno.ENOTCONN,   # Socket is not connected
                 errno.ESHUTDOWN   # Cannot send after transport endpoint shutdown
             ):
@@ -536,6 +554,9 @@ class OBSWebSocket:
                 except:
                     pass
             
+            self.authenticated = False
+            self._buffer = bytearray()
+            self._message = bytearray()
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)
             self.socket.connect((self.host, self.port))
@@ -552,7 +573,7 @@ class OBSWebSocket:
                 f"\r\n"
             )
             
-            self.socket.send(handshake.encode())
+            self.socket.sendall(handshake.encode())
             
             # Read handshake response
             handshake_response = b""
@@ -561,6 +582,10 @@ class OBSWebSocket:
                 if not chunk:
                     break
                 handshake_response += chunk
+            
+            # Anything after the HTTP headers is already WebSocket data
+            handshake_response, _, leftover = handshake_response.partition(b"\r\n\r\n")
+            self._buffer.extend(leftover)
             
             try:
                 response = handshake_response.decode('utf-8', errors='ignore')
@@ -591,7 +616,8 @@ class OBSWebSocket:
                         "op": 1,  # Identify
                         "d": {
                             "rpcVersion": 1,
-                            "authentication": auth_string
+                            "authentication": auth_string,
+                            "eventSubscriptions": 0  # Requests only, no event traffic
                         }
                     }
                 else:
@@ -599,7 +625,8 @@ class OBSWebSocket:
                     identify_msg = {
                         "op": 1,  # Identify
                         "d": {
-                            "rpcVersion": 1
+                            "rpcVersion": 1,
+                            "eventSubscriptions": 0  # Requests only, no event traffic
                         }
                     }
                 
@@ -619,17 +646,18 @@ class OBSWebSocket:
             return False
     
     def _send_message(self, message_data: dict):
-        """Send WebSocket message with proper framing"""
-        message = json.dumps(message_data)
-        message_bytes = message.encode('utf-8')
-        
+        """Send a JSON message as a WebSocket text frame"""
+        self._send_frame(0x1, json.dumps(message_data).encode('utf-8'))
+    
+    def _send_frame(self, opcode: int, message_bytes: bytes):
+        """Send a single masked WebSocket frame"""
         frame = bytearray()
-        frame.append(0x81)  # Text frame, final
+        frame.append(0x80 | opcode)  # Final frame with the given opcode
         
         msg_len = len(message_bytes)
         if msg_len < 126:
             frame.append(msg_len | 0x80)  # Set mask bit
-        elif msg_len < 65516:
+        elif msg_len < 65536:
             frame.append(126 | 0x80)
             frame.extend(struct.pack('>H', msg_len))
         else:
@@ -644,69 +672,99 @@ class OBSWebSocket:
         for i, byte in enumerate(message_bytes):
             frame.append(byte ^ mask_key[i % 4])
         
-        self.socket.send(bytes(frame))
+        self.socket.settimeout(10)  # Reads leave a short timeout behind
+        self.socket.sendall(bytes(frame))
     
-    def _receive_message(self) -> Optional[dict]:
-        """Receive and parse WebSocket message"""
-        try:
-            self.socket.settimeout(5)
-            response_data = self.socket.recv(4096)
+    def _fill_buffer(self, needed: int, deadline: float) -> bool:
+        """
+        Read from the socket until the buffer holds at least `needed` bytes
+        
+        TCP does not preserve message boundaries, so a frame can arrive split
+        across reads or share a read with the next frame. Partial data stays
+        in the buffer for the next call.
+        """
+        while len(self._buffer) < needed:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
             
-            if len(response_data) < 2:
+            self.socket.settimeout(remaining)
+            try:
+                chunk = self.socket.recv(65536)
+            except socket.timeout:
+                return False
+            
+            if not chunk:  # Peer closed the connection
+                self.authenticated = False
+                return False
+            
+            self._buffer.extend(chunk)
+        
+        return True
+    
+    def _read_frame(self, deadline: float) -> Optional[Tuple[bool, int, bytes]]:
+        """Return (final, opcode, payload) for the next complete frame, or None"""
+        if not self._fill_buffer(2, deadline):
+            return None
+        
+        final = (self._buffer[0] & 0x80) != 0
+        opcode = self._buffer[0] & 0x0F
+        masked = (self._buffer[1] & 0x80) != 0
+        payload_len = self._buffer[1] & 0x7F
+        header_length = 2
+        
+        if payload_len == 126:
+            if not self._fill_buffer(4, deadline):
                 return None
+            payload_len = struct.unpack('>H', self._buffer[2:4])[0]
+            header_length = 4
+        elif payload_len == 127:
+            if not self._fill_buffer(10, deadline):
+                return None
+            payload_len = struct.unpack('>Q', self._buffer[2:10])[0]
+            header_length = 10
+        
+        payload_start = header_length + (4 if masked else 0)
+        if not self._fill_buffer(payload_start + payload_len, deadline):
+            return None
+        
+        payload = bytes(self._buffer[payload_start:payload_start + payload_len])
+        if masked:
+            mask_key = self._buffer[header_length:payload_start]
+            payload = bytes(byte ^ mask_key[i % 4] for i, byte in enumerate(payload))
+        
+        del self._buffer[:payload_start + payload_len]
+        return final, opcode, payload
+    
+    def _receive_message(self, timeout: float = 5) -> Optional[dict]:
+        """Receive the next complete JSON message, handling control frames"""
+        try:
+            deadline = time.monotonic() + timeout
             
-            # Parse WebSocket frame header
-            first_byte = response_data[0]
-            second_byte = response_data[1]
-            
-            # Extract payload length
-            payload_len = second_byte & 0x7F
-            mask_bit = (second_byte & 0x80) != 0
-            
-            header_length = 2
-            
-            if payload_len == 126:
-                if len(response_data) < 4:
+            while True:
+                frame = self._read_frame(deadline)
+                if frame is None:
                     return None
-                payload_len = struct.unpack('>H', response_data[2:4])[0]
-                header_length = 4
-            elif payload_len == 127:
-                if len(response_data) < 10:
+                
+                final, opcode, payload = frame
+                
+                if opcode == 0x8:  # Close
+                    self.authenticated = False
                     return None
-                payload_len = struct.unpack('>Q', response_data[2:10])[0]
-                header_length = 10
-            
-            # Handle masking
-            if mask_bit:
-                if len(response_data) < header_length + 4:
-                    return None
-                mask_key = response_data[header_length:header_length + 4]
-                payload_start = header_length + 4
-            else:
-                payload_start = header_length
-            
-            # Extract payload
-            if len(response_data) < payload_start + payload_len:
-                remaining_bytes = payload_start + payload_len - len(response_data)
-                try:
-                    additional_data = self.socket.recv(remaining_bytes)
-                    response_data += additional_data
-                except socket.timeout:
-                    return None
-            
-            payload_data = response_data[payload_start:payload_start + payload_len]
-            
-            # Unmask payload if masked
-            if mask_bit:
-                unmasked_payload = bytearray()
-                for i in range(len(payload_data)):
-                    unmasked_payload.append(payload_data[i] ^ mask_key[i % 4])
-                payload_data = bytes(unmasked_payload)
-            
-            # Decode and parse JSON
-            payload_str = payload_data.decode('utf-8')
-            return json.loads(payload_str)
-            
+                if opcode == 0x9:  # Ping
+                    self._send_frame(0xA, payload)
+                    continue
+                if opcode == 0xA:  # Pong
+                    continue
+                
+                self._message.extend(payload)
+                if not final:
+                    continue
+                
+                message = bytes(self._message)
+                self._message = bytearray()
+                return json.loads(message.decode('utf-8'))
+        
         except (socket.timeout, json.JSONDecodeError, UnicodeDecodeError):
             return None
         except Exception as e:
@@ -714,6 +772,33 @@ class OBSWebSocket:
                 self.authenticated = False
             return None
     
+    def _next_request_id(self) -> str:
+        """Return an ID that is unique within this client"""
+        self._request_counter += 1
+        return f"{int(time.time() * 1000)}-{self._request_counter}"
+    
+    def _wait_for_response(self, request_id: str, timeout: float = 10) -> Optional[dict]:
+        """
+        Wait for the reply to one specific request
+        
+        Replies to earlier requests, such as the unread reply to StopStream,
+        are skipped so that they cannot be mistaken for this one.
+        """
+        deadline = time.monotonic() + timeout
+        
+        while self.authenticated:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            
+            response = self._receive_message(timeout=min(remaining, 5))
+            if response and response.get('op') == 7:  # RequestResponse
+                data = response.get('d', {})
+                if data.get('requestId') == request_id:
+                    return data
+        
+        return None
+
     def send_request(self, request_type: str, request_data: dict = None, 
                     expect_response: bool = True, max_retries: int = 3) -> bool:
         """
@@ -731,7 +816,7 @@ class OBSWebSocket:
         
         for attempt in range(1, max_retries + 1):
             try:
-                request_id = str(int(time.time() * 1000))
+                request_id = self._next_request_id()
                 message = {
                     "op": 6,  # Request
                     "d": {
@@ -751,41 +836,28 @@ class OBSWebSocket:
                     time.sleep(0.2)  # Brief pause to let OBS process
                     return True
                 
-                # Wait for response
-                start_time = time.time()
-                timeout = 10
+                # Wait for the reply to this request
+                response_data = self._wait_for_response(request_id)
                 
-                while time.time() - start_time < timeout:
-                    response = self._receive_message()
+                if response_data is not None:
+                    request_status = response_data.get('requestStatus', {})
                     
-                    if not response:
-                        time.sleep(0.1)
-                        continue
-                    
-                    if response.get('op') == 7:  # RequestResponse
-                        request_status = response.get('d', {}).get('requestStatus', {})
-                        
-                        if request_status.get('result'):
-                            if attempt > 1:
-                                print(f"OBS command successful on attempt {attempt}: {request_type}")
-                            else:
-                                print(f"OBS command successful: {request_type}")
-                            return True
+                    if request_status.get('result'):
+                        if attempt > 1:
+                            print(f"OBS command successful on attempt {attempt}: {request_type}")
                         else:
-                            error_code = request_status.get('code', 'UNKNOWN')
-                            error_comment = request_status.get('comment', 'No error message')
-                            print(f"OBS command failed: {request_type}")
-                            print(f"  Error: {error_comment} (code: {error_code})")
-                            
-                            # Don't retry on certain error codes
-                            if error_code in [600, 601, 602]:
-                                return False
-                            break
-                    elif response.get('op') == 5:  # Event - ignore
-                        continue
-                
-                # Timeout or error occurred
-                if not self.authenticated:
+                            print(f"OBS command successful: {request_type}")
+                        return True
+                    
+                    error_code = request_status.get('code', 'UNKNOWN')
+                    error_comment = request_status.get('comment', 'No error message')
+                    print(f"OBS command failed: {request_type}")
+                    print(f"  Error: {error_comment} (code: {error_code})")
+                    
+                    # Don't retry on certain error codes
+                    if error_code in [600, 601, 602]:
+                        return False
+                elif not self.authenticated:
                     print(f"Connection lost during {request_type}")
                     if attempt < max_retries:
                         print("Attempting to reconnect...")
@@ -823,7 +895,7 @@ class OBSWebSocket:
         the command without waiting for a response.
         """
         try:
-            request_id = str(int(time.time() * 1000))
+            request_id = self._next_request_id()
             message = {
                 "op": 6,
                 "d": {
@@ -867,17 +939,18 @@ class OBSWebSocket:
         }
         return self.send_request("SetStreamServiceSettings", stream_settings)
     
-    def get_stream_status(self) -> bool:
+    def get_stream_status(self) -> Optional[bool]:
         """
         Get OBS streaming status
         
-        Returns True if currently streaming, False otherwise.
+        Returns True if streaming, False if not, and None if OBS could not
+        be asked, so that "unknown" is never mistaken for "stopped".
         """
         if not self.authenticated:
-            return False
+            return None
         
         try:
-            request_id = str(int(time.time() * 1000))
+            request_id = self._next_request_id()
             message = {
                 "op": 6,
                 "d": {
@@ -888,26 +961,16 @@ class OBSWebSocket:
             
             self._send_message(message)
             
-            # Wait for response
-            for _ in range(10):  # Try for ~5 seconds
-                response = self._receive_message()
-                
-                if not response:
-                    time.sleep(0.5)
-                    continue
-                
-                if response.get('op') == 7:  # RequestResponse
-                    response_data = response.get('d', {}).get('responseData', {})
-                    return response_data.get('outputActive', False)
-                elif response.get('op') == 5:  # Event - ignore
-                    continue
+            response = self._wait_for_response(request_id, timeout=5)
+            if response is None or not response.get('requestStatus', {}).get('result'):
+                return None
             
-            return False
-            
+            return bool(response.get('responseData', {}).get('outputActive', False))
+        
         except Exception as e:
             if self._is_connection_error(e):
                 self.authenticated = False
-            return False
+            return None
     
     def close(self):
         """Close connection"""
@@ -962,6 +1025,12 @@ class StreamScheduler:
         self.next_broadcast_id = None
         self.next_stream_id = None
         self.next_stream_key = None
+        
+        # Recovery state: the broadcast slot in progress and when to retry it
+        self.next_start_at = None
+        self.setup_done = False
+        self.retry_at = None
+        self.retry_delay = RETRY_DELAY_MIN_SECONDS
     
     def _create_events_from_schedule(self) -> List[ScheduledEvent]:
         """Convert schedule sets into list of events"""
@@ -1052,12 +1121,20 @@ class StreamScheduler:
                 return
             
             try:
-                if self.obs.get_stream_status():
-                    print(f"OBS still streaming, waiting... ({i+1})")
-                    time.sleep(wait_interval)
-                else:
+                status = self.obs.get_stream_status()
+                if status is False:
                     print("OBS has stopped streaming")
                     return
+                
+                if status:
+                    print(f"OBS still streaming, waiting... ({i+1})")
+                    # The first StopStream may have gone to a dead connection
+                    if i % 5 == 4:
+                        self.obs.stop_streaming()
+                else:
+                    print(f"Could not read OBS status, retrying... ({i+1})")
+                
+                time.sleep(wait_interval)
             except Exception as e:
                 print(f"Error checking OBS status: {e}")
                 # Can't check, assume stopped
@@ -1077,7 +1154,10 @@ class StreamScheduler:
         print("Stopping current stream...")
         
         # Step 1: Send stop command to OBS
-        self.obs.stop_streaming()
+        if self.ensure_obs_connection():
+            self.obs.stop_streaming()
+        else:
+            print("Could not reach OBS to stop streaming")
         
         # Step 2: End YouTube broadcast
         if self.current_broadcast_id:
@@ -1102,6 +1182,12 @@ class StreamScheduler:
             print("Failed to ensure OBS connection")
             return False
         
+        # OBS cannot take a new key while running, for example during a retry
+        if self.obs.get_stream_status():
+            print("OBS is still streaming, stopping it first...")
+            self.obs.stop_streaming()
+            self.wait_for_obs_stop()
+        
         if not self.obs.set_stream_settings(stream_key):
             print("Failed to configure OBS with stream key")
             return False
@@ -1114,14 +1200,18 @@ class StreamScheduler:
         print("OBS streaming started successfully!")
         return True
     
-    def create_next_stream(self, target_start_time: dt_time) -> bool:
-        """Create the next scheduled stream"""
-        now = datetime.now(timezone.utc)
+    def create_next_stream(self) -> bool:
+        """
+        Create the broadcast for self.next_start_at and start OBS
         
-        # Calculate next occurrence
-        next_start = datetime.combine(now.date(), target_start_time, timezone.utc)
-        if next_start <= now:
-            next_start += timedelta(days=1)
+        Safe to call again after a failure: a broadcast that already exists
+        is reused rather than created twice.
+        """
+        now = datetime.now(timezone.utc)
+        next_start = self.next_start_at
+        
+        if self.next_broadcast_id:
+            return self._start_obs_for_next_stream(next_start)
         
         # Generate title
         date_str = next_start.strftime('%y%m%d')
@@ -1133,27 +1223,34 @@ class StreamScheduler:
             time_str = f"{next_start.hour:02d}:{next_start.minute:02d}"
             title = f"{LIVESTREAM_NAME} {date_str} {time_str}"
         
-        print(f"Creating next stream: {title}")
-        self.next_broadcast_id = self.youtube.create_broadcast(title, next_start, self.category_id)
+        # A retry can run after the slot began; keep the slot's title but
+        # give YouTube a scheduled time that is still in the future
+        scheduled_start = max(next_start, now + timedelta(minutes=1))
         
-        if self.next_broadcast_id:
-            # Store stream ID and key
-            self.next_stream_id = getattr(self.youtube, 'current_stream_id', None)
-            self.next_stream_key = getattr(self.youtube, 'current_stream_key', None)
-            
-            # Configure and start OBS with new key
-            if self.next_stream_key:
-                if not self.start_obs_with_key(self.next_stream_key):
-                    print("Failed to start OBS with new stream key")
-                    return False
-            
-            print(f"Next stream scheduled for: {next_start.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-            return True
-        else:
+        print(f"Creating next stream: {title}")
+        self.next_broadcast_id = self.youtube.create_broadcast(title, scheduled_start, self.category_id)
+        
+        if not self.next_broadcast_id:
             print("Failed to create next stream")
             return False
+        
+        # Store stream ID and key
+        self.next_stream_id = getattr(self.youtube, 'current_stream_id', None)
+        self.next_stream_key = getattr(self.youtube, 'current_stream_key', None)
+        
+        return self._start_obs_for_next_stream(next_start)
     
-    def start_next_stream(self) -> bool:
+    def _start_obs_for_next_stream(self, next_start: datetime) -> bool:
+        """Configure and start OBS with the next stream's key"""
+        if self.next_stream_key:
+            if not self.start_obs_with_key(self.next_stream_key):
+                print("Failed to start OBS with new stream key")
+                return False
+        
+        print(f"Next stream scheduled for: {next_start.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        return True
+    
+    def start_next_stream(self, max_attempts: int = 30) -> bool:
         """Start the next YouTube broadcast with retry logic"""
         if not self.next_broadcast_id:
             print("No next broadcast to start")
@@ -1173,10 +1270,11 @@ class StreamScheduler:
                     return False
             
             # Retry logic for testing to live transition
-            max_attempts = 30
             for attempt in range(1, max_attempts + 1):
                 print(f"Attempting to go live (attempt {attempt}/{max_attempts})")
-                success = self.youtube.start_broadcast(self.next_broadcast_id)
+                # An earlier attempt may have worked even if its reply was lost
+                success = (self.youtube.get_broadcast_status(self.next_broadcast_id) == 'live'
+                           or self.youtube.start_broadcast(self.next_broadcast_id))
                 
                 if success:
                     self.current_broadcast_id = self.next_broadcast_id
@@ -1191,12 +1289,100 @@ class StreamScheduler:
                         print("Waiting 10 seconds before retry...")
                         time.sleep(10)
             
-            # All attempts failed
+            # All attempts failed; the scheduler keeps running and retries
             print("CRITICAL ERROR - unable to transition to live")
-            exit(1)
+            return False
         
         print("Failed to start broadcast - stream not active")
         return False
+    
+    def _schedule_retry(self):
+        """Set the time of the next recovery attempt, backing off each time"""
+        self.retry_at = datetime.now(timezone.utc) + timedelta(seconds=self.retry_delay)
+        print(f"Will retry at {self.retry_at.strftime('%H:%M:%S UTC')}")
+        self.retry_delay = min(self.retry_delay * 2, RETRY_DELAY_MAX_SECONDS)
+    
+    def _reset_retry(self):
+        """Clear the retry timer and backoff"""
+        self.retry_at = None
+        self.retry_delay = RETRY_DELAY_MIN_SECONDS
+    
+    def _attempt_setup(self) -> bool:
+        """Create the next stream, scheduling a retry if that fails"""
+        try:
+            self.setup_done = self.create_next_stream()
+        except Exception as e:
+            print(f"Error setting up next stream: {e}")
+            self.setup_done = False
+        
+        if self.setup_done:
+            self._reset_retry()
+        else:
+            self._schedule_retry()
+        return self.setup_done
+    
+    def _attempt_go_live(self, max_attempts: int = 30) -> bool:
+        """Take the next stream live, scheduling a retry if that fails"""
+        try:
+            # YouTube can only see the stream if OBS is still sending it
+            ready = True
+            if self.ensure_obs_connection() and self.obs.get_stream_status() is False:
+                print("OBS is not streaming, restarting it...")
+                ready = self.start_obs_with_key(self.next_stream_key)
+            live = ready and self.start_next_stream(max_attempts)
+        except Exception as e:
+            print(f"Error going live: {e}")
+            live = False
+        
+        if live:
+            self.next_start_at = None
+            self.setup_done = False
+            self._reset_retry()
+        else:
+            self._schedule_retry()
+        return live
+    
+    def handle_stop_event(self, event: ScheduledEvent):
+        """End the current stream and prepare the next broadcast slot"""
+        # Record the slot first so a failure below can still be recovered
+        now = datetime.now(timezone.utc)
+        next_start = datetime.combine(now.date(), event.original_start_time, timezone.utc)
+        if next_start <= now:
+            next_start += timedelta(days=1)
+        
+        self.next_start_at = next_start
+        self.next_broadcast_id = None
+        self.next_stream_id = None
+        self.next_stream_key = None
+        self.setup_done = False
+        self._reset_retry()
+        
+        try:
+            self.stop_current_stream()
+        except Exception as e:
+            print(f"Error stopping current stream: {e}")
+        
+        self._attempt_setup()
+    
+    def handle_start_event(self):
+        """Go live at the scheduled start, if the stream is ready"""
+        if self.setup_done and self.next_broadcast_id:
+            self._attempt_go_live()
+    
+    def service_pending_work(self):
+        """Retry a failed setup or go-live, so one failure cannot cost a whole cycle"""
+        if self.next_start_at is None:
+            return
+        
+        if self.retry_at and datetime.now(timezone.utc) < self.retry_at:
+            return
+        
+        if not self.setup_done and not self._attempt_setup():
+            return
+        
+        # Normally the START event does this; here it failed or was missed
+        if datetime.now(timezone.utc) >= self.next_start_at:
+            self._attempt_go_live(RETRY_GO_LIVE_ATTEMPTS)
     
     def run_schedule(self):
         """Main scheduling loop with event-based timing"""
@@ -1209,6 +1395,7 @@ class StreamScheduler:
         
         while True:
             try:
+                self.service_pending_work()
                 now = datetime.now(timezone.utc)
                 
                 # Get next event
@@ -1218,7 +1405,7 @@ class StreamScheduler:
                     time_until_event = (event_time - now).total_seconds()
                     
                     # Low-activity mode for long waits
-                    if time_until_event > 3 * 60 * 60:  # More than 3 hours
+                    if time_until_event > 3 * 60 * 60 and self.next_start_at is None:  # More than 3 hours
                         print(f"\rNext event in {time_until_event/3600:.1f} hours - entering low-activity mode    ", end='', flush=True)
                         time.sleep(30 * 60)  # 30 minutes
                         continue
@@ -1227,19 +1414,17 @@ class StreamScheduler:
                     if time_until_event <= SCHEDULE_TOLERANCE_SECONDS:
                         if next_event.event_type == "STOP":
                             print(f"\nExecuting STOP event")
-                            self.stop_current_stream()
-                            self.create_next_stream(next_event.original_start_time)
+                            self.handle_stop_event(next_event)
                             time.sleep(15)  # Prevent duplicate execution
                         elif next_event.event_type == "START":
                             print()
                             print(f"\nExecuting START event")
-                            if self.next_broadcast_id:
-                                self.start_next_stream()
+                            self.handle_start_event()
                             time.sleep(15)  # Prevent duplicate execution
                     
                     # Adaptive sleep timing
                     elif time_until_event <= 30:
-                        time.sleep(0)  # High precision
+                        time.sleep(1)  # High precision
                     elif time_until_event <= 300:  # 5 minutes
                         time.sleep(10)  # Medium precision
                     else:
